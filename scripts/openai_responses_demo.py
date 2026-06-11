@@ -1,82 +1,51 @@
+"""Connectivity self-check for the configured OpenAI-compatible gateway.
+
+Exercises the exact code path the app uses (metabase_agent.semantics.llm_client),
+including the raw-httpx /responses transport, plus a one-round tool-calling probe.
+Run: uv run python scripts/openai_responses_demo.py
+"""
 from __future__ import annotations
 
 import traceback
-from typing import Literal
 
-import httpx
-import openai
-from openai import OpenAI
-from openai.types.shared_params.reasoning import Reasoning
-
+from metabase_agent.agent.tools import tool_schemas
 from metabase_agent.config.settings import get_settings
-
-ReasoningEffort = Literal["high", "xhigh"]
-
-
-def _reasoning_effort(model: str) -> ReasoningEffort:
-    if model.lower().startswith("gpt-5.5"):
-        return "xhigh"
-    return "high"
-
-
-def _log_request(request: httpx.Request) -> None:
-    print("\n=== HTTP Request ===")
-    print(f"{request.method} {request.url}")
-    for key, value in request.headers.items():
-        if key.lower() == "authorization":
-            value = "Bearer ***"
-        print(f"{key}: {value}")
-    print("--- body ---")
-    print(request.content.decode("utf-8", errors="replace"))
-
-
-def _log_response(response: httpx.Response) -> None:
-    response.read()
-    print("\n=== HTTP Response ===")
-    print(f"status: {response.status_code}")
-    for key, value in response.headers.items():
-        print(f"{key}: {value}")
-    print("--- body ---")
-    print(response.text)
+from metabase_agent.semantics.llm_client import build_tool_transport, complete
 
 
 def main() -> None:
     settings = get_settings()
-    print("=== OpenAI Responses SDK Demo ===")
-    print(f"openai_version={openai.__version__}")
+    print("=== Gateway Connectivity Check ===")
     print(f"base_url={settings.openai_base_url}")
     print(f"model={settings.openai_model}")
+    print(f"wire_api={settings.openai_wire_api}")
     print(f"api_key_set={bool(settings.openai_api_key)}")
-
-    http_client = httpx.Client(
-        event_hooks={
-            "request": [_log_request],
-            "response": [_log_response],
-        },
-        timeout=180,
-    )
-    client = OpenAI(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-        http_client=http_client,
-    )
+    if not settings.openai_api_key:
+        print("\nOPENAI_API_KEY is empty; set it in .env to run this check.")
+        return
 
     try:
-        response = client.responses.create(
-            model=settings.openai_model,
-            reasoning=Reasoning(effort=_reasoning_effort(settings.openai_model)),
-            input="Write a short bedtime story about a unicorn.",
-        )
+        text = complete("你是一个测试助手，只回一句话。", "说一句中文问候。", settings)
+        print("\n=== Plain completion OK ===")
+        print(text)
     except Exception as exc:
-        print("\n=== Exception ===")
-        print(f"type={type(exc).__name__}")
-        print(f"message={exc}")
-        print("--- traceback ---")
+        print("\n=== Plain completion FAILED ===")
+        print(f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
-        raise
+        return
 
-    print("\n=== Parsed Output ===")
-    print(response.output_text)
+    try:
+        transport = build_tool_transport(settings)
+        reply = transport.complete(
+            [{"role": "user", "content": "列出有哪些数据库。"}],
+            tool_schemas(),
+        )
+        print("\n=== Tool-calling probe OK ===")
+        print("tool_calls" if isinstance(reply, list) else "text", "->", reply)
+    except Exception as exc:
+        print("\n=== Tool-calling probe FAILED ===")
+        print(f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
