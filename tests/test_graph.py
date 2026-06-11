@@ -1,4 +1,5 @@
-from metabase_agent.agent.graph import _find_table, _infer_database_name, build_graph
+from metabase_agent.agent.graph import build_graph
+from metabase_agent.agent.metadata import _find_table, _infer_database_name
 from metabase_agent.config.settings import Settings
 
 

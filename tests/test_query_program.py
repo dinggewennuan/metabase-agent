@@ -1,9 +1,9 @@
 from datetime import date, timedelta
 
-from metabase_agent.agent.graph import _table_aggregation_v1_payload
 from metabase_agent.policy.query_policy import check_program
 from metabase_agent.query.query_planner import build_query_plan
 from metabase_agent.query.query_program_builder import (
+    _table_aggregation_v1_payload,
     build_program,
     build_table_aggregation_program,
 )

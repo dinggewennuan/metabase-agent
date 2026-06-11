@@ -6,45 +6,17 @@ from typing import Any, Mapping, cast
 import httpx
 from langgraph.graph import END, START, StateGraph
 
-from metabase_agent.agent.clarify import (
-    _database_clarification_suggestions,
-    _table_candidate_suggestions,
-    _table_clarification_suggestions,
-)
 from metabase_agent.agent.dry_run import (
-    _dry_databases,
     _dry_metric,
     _dry_result,
     _dry_search,
-    _dry_table_fields,
-    _dry_table_query_metadata,
-    _dry_tables,
 )
-from metabase_agent.agent.metadata import (
-    _database_items,
-    _database_names,
-    _field_id,
-    _field_names,
-    _fields,
-    _filter_tables_by_schema,
-    _find_database,
-    _find_field,
-    _find_table,
-    _first_datetime_field,
-    _first_numeric_field,
-    _infer_database_name,
-    _is_schema_not_found,
-    _match_agent_field_id,
-    _rank_table_candidates,
-    _table_items,
-    _table_schema,
-)
+from metabase_agent.agent.metadata_flow import run_database_metadata
 from metabase_agent.agent.sql_review import (
     _should_execute_generated_sql,
     _sql_explanation_response,
     _sql_review_response,
     _sql_review_with_optional_explanation,
-    _table_sql_preview,
 )
 from metabase_agent.agent.state import AgentState
 from metabase_agent.agent.trace import append_trace as _append_trace
@@ -58,9 +30,7 @@ from metabase_agent.query.bigquery_report_sql import (
 )
 from metabase_agent.query.query_planner import build_query_plan
 from metabase_agent.query.query_program_builder import (
-    _table_aggregation_v1_payload,
     build_program,
-    build_table_aggregation_program,
 )
 from metabase_agent.semantics.intent_parser import (
     is_safe_rule_intent_override,
@@ -229,249 +199,7 @@ def build_graph(settings: Settings):
         }
 
     def database_metadata_node(state: AgentState) -> AgentState:
-        parsed = cast(Mapping[str, Any], state.get("parsed_intent", {}))
-        intent = str(parsed.get("intent") or "")
-        database_name = str(parsed.get("database_name") or "")
-        schema_name = cast(str | None, parsed.get("schema_name"))
-        table_name = str(parsed.get("table_name") or "")
-        field_name = str(parsed.get("field_name") or "")
-        date_field_name = str(parsed.get("date_field_name") or "")
-        aggregation_function = str(parsed.get("aggregation_function") or "")
-        relative_days = cast(int | None, parsed.get("relative_days"))
-        time_grain = cast(str | None, parsed.get("time_grain"))
-        if state.get("dry_run"):
-            databases = _dry_databases()
-            dry_database = _find_database(databases, database_name)
-            dry_database_name = str(dry_database.get("name")) if dry_database else database_name
-            tables = _dry_tables(dry_database_name)
-            trace = _append_trace(state, {"step": "metadata.dry_run", "database_count": len(databases), "table_count": len(tables)})
-        else:
-            trace = _append_trace(state, {"step": "metabase.request", "endpoint": "GET /api/database"})
-            databases = _database_items(client.list_databases())
-            trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": "GET /api/database", "database_names": [database.get("name") for database in databases]})
-            tables: list[dict[str, Any]] = []
-
-        if intent == "database_count":
-            return {
-                "answer": f"当前可访问的数据库共有 {len(databases)} 个。",
-                "query_plan": {"intent": intent},
-                "query_result": {"status": "completed", "database_count": len(databases), "databases": [database.get("name") for database in databases]},
-                "trace": trace,
-            }
-
-        if intent == "database_list":
-            names = [str(database.get("name")) for database in databases]
-            return {
-                "answer": "当前可访问的数据库：" + "、".join(names),
-                "query_plan": {"intent": intent},
-                "query_result": {"status": "completed", "database_count": len(names), "databases": names},
-                "trace": trace,
-            }
-
-        database_names = _database_names(databases)
-
-        if intent in {"table_field_list", "table_aggregation"} and not database_name and not schema_name:
-            return {
-                "answer": f"请先确认要在哪个数据库中查询 `{table_name}`。当前可访问数据库：" + "、".join(database_names),
-                "query_plan": {"intent": intent, "table_name": table_name, "requires_clarification": True, "clarification_type": "database"},
-                "query_result": {"status": "requires_clarification", "clarification_type": "database", "table_name": table_name, "available_databases": database_names, "suggestions": _database_clarification_suggestions(database_names, table_name, aggregation_function, relative_days, time_grain)},
-                "trace": _append_trace({"trace": trace}, {"step": "metadata.clarify_database", "status": "requires_clarification", "table_name": table_name, "available_databases": database_names}),
-            }
-
-        if state.get("dry_run"):
-            if not database_name:
-                database_name = _infer_database_name(databases, schema_name)
-            database = _find_database(databases, database_name)
-        else:
-            if not database_name:
-                database_name = _infer_database_name(databases, schema_name)
-            database = _find_database(databases, database_name)
-            if database is None:
-                return {
-                    "answer": f"没有找到名为 `{database_name}` 的数据库。当前可访问数据库：" + "、".join(str(database.get("name")) for database in databases),
-                    "query_plan": {"intent": intent, "database_name": database_name, "requires_clarification": True},
-                    "query_result": {"status": "not_found", "database_name": database_name, "available_databases": [database.get("name") for database in databases]},
-                    "trace": _append_trace({"trace": trace}, {"step": "metadata.match_database", "status": "not_found", "target": database_name}),
-                }
-            database_id = int(database["id"])
-            trace = _append_trace({"trace": trace}, {"step": "metadata.match_database", "status": "matched", "database_id": database_id, "database_name": database.get("name")})
-            if schema_name and database_name:
-                try:
-                    trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": f"GET /api/database/{database_id}/schema/{schema_name}"})
-                    schema_metadata = client.get_database_schema(database_id, schema_name)
-                    tables = _table_items(schema_metadata)
-                    trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/database/{database_id}/schema/{schema_name}", "table_count": len(tables), "table_names": [table.get("name") for table in tables if isinstance(table, dict)]})
-                except httpx.HTTPStatusError as exc:
-                    if not _is_schema_not_found(exc):
-                        raise
-                    trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/database/{database_id}/schema/{schema_name}", "status": "not_found", "fallback": "GET /api/database/{database_id}/metadata"})
-                    trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": f"GET /api/database/{database_id}/metadata"})
-                    database_metadata = client.get_database_metadata(database_id)
-                    tables = database_metadata.get("tables", []) if isinstance(database_metadata, dict) else []
-                    trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/database/{database_id}/metadata", "table_count": len(tables), "table_names": [table.get("name") for table in tables if isinstance(table, dict)]})
-            else:
-                trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": f"GET /api/database/{database_id}/metadata"})
-                database_metadata = client.get_database_metadata(database_id)
-                tables = database_metadata.get("tables", []) if isinstance(database_metadata, dict) else []
-                trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/database/{database_id}/metadata", "table_count": len(tables), "table_names": [table.get("name") for table in tables if isinstance(table, dict)]})
-
-        if database is None:
-            return {
-                "answer": f"没有找到名为 `{database_name}` 的数据库。当前可访问数据库：" + "、".join(str(database.get("name")) for database in databases),
-                "query_plan": {"intent": intent, "database_name": database_name, "requires_clarification": True},
-                "query_result": {"status": "not_found", "database_name": database_name, "available_databases": [database.get("name") for database in databases]},
-                "trace": _append_trace({"trace": trace}, {"step": "metadata.match_database", "status": "not_found", "target": database_name}),
-            }
-
-        database_display_name = str(database.get("name", database_name))
-        if schema_name and any(_table_schema(table) for table in tables):
-            tables = _filter_tables_by_schema(tables, schema_name)
-        table_names = [str(table.get("name")) for table in tables if isinstance(table, dict)]
-        if schema_name:
-            trace = _append_trace({"trace": trace}, {"step": "metadata.filter_schema", "schema_name": schema_name, "table_count": len(tables), "table_names": table_names})
-
-        if intent == "database_table_list":
-            return {
-                "answer": f"`{database_display_name}`" + (f" 下 `{schema_name}`" if schema_name else "") + " 的表：" + "、".join(table_names),
-                "query_plan": {"intent": intent, "database_name": database_display_name, "schema_name": schema_name},
-                "query_result": {"status": "completed", "database_name": database_display_name, "schema_name": schema_name, "table_count": len(table_names), "tables": table_names},
-                "trace": trace,
-            }
-
-        if intent == "table_field_list":
-            table = _find_table(tables, table_name)
-            if table is None:
-                candidates = _rank_table_candidates(tables, table_name)
-                candidate_names = [str(candidate.get("name")) for candidate, _score in candidates[:5] if candidate.get("name")]
-                return {
-                    "answer": f"在 `{database_display_name}`" + (f" 下 `{schema_name}`" if schema_name else "") + f" 没有找到名为 `{table_name}` 的表。" + ("可能相关的表：" + "、".join(candidate_names) + "。" if candidate_names else "") + "当前可用表：" + "、".join(table_names) + "。你可以选择其中一个表继续提问，或者更改数据库。",
-                    "query_plan": {"intent": intent, "database_name": database_display_name, "schema_name": schema_name, "table_name": table_name, "requires_clarification": True, "clarification_type": "table"},
-                    "query_result": {"status": "not_found", "clarification_type": "table", "database_name": database_display_name, "schema_name": schema_name, "table_name": table_name, "available_tables": table_names, "candidate_tables": candidate_names, "available_databases": database_names, "suggestions": _table_candidate_suggestions(intent, candidates, schema_name, aggregation_function, relative_days, time_grain) or _table_clarification_suggestions(intent, table_names, schema_name, aggregation_function, relative_days, time_grain)},
-                    "trace": _append_trace({"trace": trace}, {"step": "metadata.match_table", "status": "not_found", "target": table_name}),
-                }
-            if state.get("dry_run"):
-                field_metadata = _dry_table_fields()
-                fields = cast(list[str], field_metadata["fields"])
-            else:
-                trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": f"GET /api/table/{int(table['id'])}/query_metadata"})
-                table_metadata = client.get_table_query_metadata(int(table["id"]))
-                fields = _field_names(table_metadata)
-                trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/table/{int(table['id'])}/query_metadata", "field_count": len(fields)})
-            table_display_name = str(table.get("name", table_name))
-            return {
-                "answer": f"`{table_display_name}` 表共有 {len(fields)} 个字段：" + "、".join(fields),
-                "query_plan": {"intent": intent, "table_name": table_display_name},
-                "query_result": {"status": "completed", "table_name": table_display_name, "field_count": len(fields), "fields": fields},
-                "trace": trace,
-            }
-
-        if intent == "table_aggregation":
-            table = _find_table(tables, table_name)
-            if table is None:
-                candidates = _rank_table_candidates(tables, table_name)
-                candidate_names = [str(candidate.get("name")) for candidate, _score in candidates[:5] if candidate.get("name")]
-                return {
-                    "answer": f"在 `{database_display_name}`" + (f" 下 `{schema_name}`" if schema_name else "") + f" 没有找到名为 `{table_name}` 的表。" + ("可能相关的表：" + "、".join(candidate_names) + "。" if candidate_names else "") + "当前可用表：" + "、".join(table_names) + "。你可以选择其中一个表继续提问，或者更改数据库。",
-                    "query_plan": {"intent": intent, "database_name": database_display_name, "schema_name": schema_name, "table_name": table_name, "requires_clarification": True, "clarification_type": "table"},
-                    "query_result": {"status": "not_found", "clarification_type": "table", "database_name": database_display_name, "schema_name": schema_name, "table_name": table_name, "available_tables": table_names, "candidate_tables": candidate_names, "available_databases": database_names, "suggestions": _table_candidate_suggestions(intent, candidates, schema_name, aggregation_function, relative_days, time_grain) or _table_clarification_suggestions(intent, table_names, schema_name, aggregation_function, relative_days, time_grain)},
-                    "trace": _append_trace({"trace": trace}, {"step": "metadata.match_table", "status": "not_found", "target": table_name}),
-                }
-            table_display_name = str(table.get("name", table_name))
-            if state.get("dry_run"):
-                fields_payload = _dry_table_query_metadata()
-                agent_fields: list[dict[str, Any]] = []
-            else:
-                trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": f"GET /api/table/{int(table['id'])}/query_metadata"})
-                fields_payload = client.get_table_query_metadata(int(table["id"]))
-                trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/table/{int(table['id'])}/query_metadata", "field_count": len(_fields(fields_payload))})
-                trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": f"GET /api/agent/v1/table/{int(table['id'])}"})
-                agent_table_payload = client.get_table(int(table["id"]))
-                agent_fields = _fields(agent_table_payload)
-                trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/agent/v1/table/{int(table['id'])}", "field_count": len(agent_fields)})
-            fields = _fields(fields_payload)
-            field = None
-            if aggregation_function != "count":
-                field = _find_field(fields, field_name) if field_name else _first_numeric_field(fields)
-                if field is None:
-                    return {
-                        "answer": f"没有找到可用于 `{aggregation_function}` 的字段，请指定数值字段。",
-                        "query_plan": {"intent": intent, "table_name": table_display_name, "aggregation_function": aggregation_function, "requires_clarification": True},
-                        "query_result": {"status": "not_found", "table_name": table_display_name, "available_fields": [str(item.get("name") or item.get("display_name")) for item in fields]},
-                        "trace": _append_trace({"trace": trace}, {"step": "metadata.match_field", "status": "not_found", "target": field_name}),
-                    }
-            field_id = _field_id(field) if field else None
-            date_field = None
-            if relative_days is not None or time_grain:
-                date_field = _find_field(fields, date_field_name) if date_field_name else _first_datetime_field(fields)
-                if date_field is None:
-                    return {
-                        "answer": "没有找到可用于时间过滤/按天分组的日期字段，请指定时间字段。",
-                        "query_plan": {"intent": intent, "table_name": table_display_name, "aggregation_function": aggregation_function, "relative_days": relative_days, "time_grain": time_grain, "requires_clarification": True},
-                        "query_result": {"status": "not_found", "table_name": table_display_name, "available_fields": [str(item.get("name") or item.get("display_name")) for item in fields]},
-                        "trace": _append_trace({"trace": trace}, {"step": "metadata.match_date_field", "status": "not_found", "target": date_field_name}),
-                    }
-            date_field_id = _field_id(date_field) if date_field else None
-            if date_field is not None and date_field_id is None:
-                return {
-                    "answer": f"时间字段 `{date_field_name}` 缺少 Metabase field id，不能过滤或分组。",
-                    "query_plan": {"intent": intent, "table_name": table_display_name, "aggregation_function": aggregation_function, "requires_clarification": True},
-                    "query_result": {"status": "not_found", "table_name": table_display_name, "date_field_name": date_field_name},
-                    "trace": _append_trace({"trace": trace}, {"step": "metadata.match_date_field", "status": "missing_id", "target": date_field_name}),
-                }
-            if aggregation_function != "count" and field_id is None:
-                return {
-                    "answer": f"字段 `{field_name}` 缺少 Metabase field id，不能聚合。",
-                    "query_plan": {"intent": intent, "table_name": table_display_name, "aggregation_function": aggregation_function, "requires_clarification": True},
-                    "query_result": {"status": "not_found", "table_name": table_display_name, "field_name": field_name},
-                    "trace": _append_trace({"trace": trace}, {"step": "metadata.match_field", "status": "missing_id", "target": field_name}),
-                }
-            program = build_table_aggregation_program(int(table["id"]), aggregation_function, field_id, date_field_id=date_field_id, relative_days=relative_days, time_grain=time_grain)
-            agent_field_ids: dict[int, str | None] = {}
-            if field_id is not None and field:
-                agent_field_ids[field_id] = _match_agent_field_id(agent_fields, field)
-            if date_field_id is not None and date_field:
-                agent_field_ids[date_field_id] = _match_agent_field_id(agent_fields, date_field)
-            mapped_agent_field_ids = {key: value for key, value in agent_field_ids.items() if value}
-            if mapped_agent_field_ids:
-                program["agent_field_ids"] = mapped_agent_field_ids
-            query_plan = {"intent": intent, "database_name": database_display_name, "schema_name": schema_name, "table_name": table_display_name, "field_name": field_name or (str(field.get("name") or field.get("display_name")) if field else None), "date_field_name": date_field_name or (str(date_field.get("name") or date_field.get("display_name")) if date_field else None), "aggregation_function": aggregation_function, "relative_days": relative_days, "time_grain": time_grain}
-            if not state.get("sql_approved"):
-                sql = _table_sql_preview(schema_name, table_display_name, aggregation_function, field, date_field, relative_days, time_grain)
-                return _sql_review_response(sql, {**program, "preview_sql": sql}, query_plan, trace, preview_only=True)
-            if state.get("dry_run"):
-                if date_field_id is not None and time_grain:
-                    date_field_display_name = str(date_field["display_name"] or date_field["name"]) if date_field else "date"
-                    query_result = {"status": "completed", "data": {"cols": [{"display_name": date_field_display_name}, {"display_name": aggregation_function}], "rows": [["2026-05-11", 3], ["2026-05-12", 5]]}, "row_count": 2}
-                else:
-                    query_result = {"status": "completed", "data": {"cols": [{"display_name": aggregation_function}], "rows": [[3]]}, "row_count": 1}
-            else:
-                query_program = {"source": program["source"], "operations": program["operations"]}
-                trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": "POST /api/agent/v2/query", "program": query_program})
-                try:
-                    query_result = client.query(query_program)
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code != 404:
-                        raise
-                    v1_payload = _table_aggregation_v1_payload(program)
-                    trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": "POST /api/agent/v2/query", "status": "not_found", "fallback": "POST /api/agent/v1/construct-query"})
-                    trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": "POST /api/agent/v1/construct-query", "payload": v1_payload})
-                    constructed = client.construct_query_v1(v1_payload)
-                    trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": "POST /api/agent/v1/execute"})
-                    query_result = client.execute_query_v1(constructed)
-            return {
-                "answer": f"已对 `{table_display_name}` 执行 `{aggregation_function}` 聚合。",
-                "query_plan": query_plan,
-                "program": program,
-                "query_result": query_result,
-                "trace": trace,
-            }
-
-        return {
-            "answer": f"`{database_display_name}`" + (f" 下 `{schema_name}`" if schema_name else " 数据库") + f"共有 {len(table_names)} 个表。",
-            "query_plan": {"intent": "database_table_count", "database_name": database_display_name, "schema_name": schema_name},
-            "query_result": {"status": "completed", "database_name": database_display_name, "schema_name": schema_name, "table_count": len(table_names), "tables": table_names},
-            "trace": trace,
-        }
+        return run_database_metadata(state, client)
 
     def search_node(state: AgentState) -> AgentState:
         parsed = cast(Mapping[str, Any], state.get("parsed_intent", {}))
