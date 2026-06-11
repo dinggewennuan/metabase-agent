@@ -221,7 +221,7 @@ uv run uvicorn metabase_agent.api.app:app --host 0.0.0.0 --port 8765
 - Metabase API Key 使用只读权限。
 - 内部网络入口加认证或网关限制（生产建议设置 `AGENT_API_TOKEN`）。
 - 如果真实查询偶发 429/502/503/504，客户端会对 GET/HEAD 做短暂重试；POST 不会自动重试，避免重复执行。
-- **单 worker 限制**：会话记忆、挂起的 SQL 审批和表上下文都保存在进程内存 + 本地 JSON 文件中。请用单 worker 运行（默认即是）；若用 `--workers N`（N>1），审批/会话状态会在进程间分裂，导致“在某进程挂起、在另一进程批准”时找不到上下文。多副本部署需先把状态外置到 Redis/数据库。
+- **状态后端与多 worker**：默认 `AGENT_STORE=memory`（进程内 + 本地 JSON），只适合单 worker；用 `--workers N`（N>1）时审批/会话状态会在进程间分裂。要跑多 worker，设 `AGENT_STORE=sqlite` 并把 `AGENT_STATE_PATH` 指向一个共享的 `.db` 文件（如 `/var/lib/metabase-agent/state.db`），各 worker 通过 SQLite（WAL）共享会话记忆、挂起审批与表上下文；可选 `AGENT_SESSION_TTL_SECONDS` 自动清理过期会话。
 - **Docker**：`docker build -t metabase-agent . && docker run --env-file .env -p 8765:8765 metabase-agent`。
 
 ## 8. 常见问题
