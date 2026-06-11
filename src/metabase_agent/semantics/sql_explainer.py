@@ -1,14 +1,9 @@
 from __future__ import annotations
 
 import re
-from typing import Any, cast
-
-import httpx
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
 
 from metabase_agent.config.settings import Settings
-from metabase_agent.semantics.llm_intent import _reasoning_effort
+from metabase_agent.semantics.llm_client import complete
 
 _SYSTEM_PROMPT = (
     "你是资深的数据分析与 SQL 审查专家。只针对用户给出的这条 SQL 进行分析，"
@@ -21,65 +16,11 @@ _SYSTEM_PROMPT = (
 
 
 def explain_sql_with_llm(sql: str, settings: Settings) -> str:
-    """Ask the LLM to explain the given SQL. Raises if no key / empty response."""
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is not configured")
-    user_content = f"请分析下面这条 SQL：\n```sql\n{sql}\n```"
-
-    if settings.openai_wire_api == "responses":
-        response = httpx.post(
-            f"{settings.openai_base_url.rstrip('/')}/responses",
-            headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
-            json={
-                "model": settings.openai_model,
-                "input": f"{_SYSTEM_PROMPT}\n\n{user_content}",
-                "reasoning": {"effort": _reasoning_effort(settings.openai_model)},
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-        text = _responses_text(response.json())
-        if not text:
-            raise RuntimeError("empty LLM response")
-        return text
-
-    client = OpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
-    messages = cast(
-        list[ChatCompletionMessageParam],
-        [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-    )
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        reasoning_effort=_reasoning_effort(settings.openai_model),
-        messages=messages,
-    )
-    text = response.choices[0].message.content
-    if not text or not text.strip():
-        raise RuntimeError("empty LLM response")
-    return text.strip()
-
-
-def _responses_text(payload: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for item in payload.get("output", []):
-        if not isinstance(item, dict):
-            continue
-        for content in item.get("content", []):
-            if isinstance(content, dict) and content.get("type") == "output_text":
-                parts.append(str(content.get("text", "")))
-    return "\n".join(part for part in parts if part).strip()
+    return complete(_SYSTEM_PROMPT, f"请分析下面这条 SQL：\n```sql\n{sql}\n```", settings)
 
 
 def structural_sql_summary(sql: str) -> str:
-    """Deterministic, always-correct summary derived from the SQL itself.
-
-    Used for dry-run and as a fallback when the LLM is unavailable. Unlike the
-    previous hardcoded explanation, every line here is computed from the actual
-    SQL, so it can never describe a different query.
-    """
+    """Deterministic fallback summary computed from the SQL itself (dry-run / no LLM)."""
     tables = _extract_tables(sql)
     ctes = _extract_ctes(sql)
     features = _detect_features(sql)

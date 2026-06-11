@@ -78,7 +78,7 @@ def test_explain_sql_with_llm_uses_chat_completions(monkeypatch) -> None:
 
         chat = _Chat()
 
-    monkeypatch.setattr("metabase_agent.semantics.sql_explainer.OpenAI", _FakeOpenAI)
+    monkeypatch.setattr("metabase_agent.semantics.llm_client.OpenAI", _FakeOpenAI)
 
     answer = explain_sql_with_llm(
         HOURLY_ACTIVE_USERS_SQL,
