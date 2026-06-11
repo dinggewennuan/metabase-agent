@@ -48,8 +48,10 @@ _logger = logging.getLogger("metabase_agent")
 
 
 def _metric_answer(intent: str, source_name: str, result: dict[str, Any]) -> str:
-    data = result.get("data") if isinstance(result.get("data"), dict) else {}
-    rows = data.get("rows") if isinstance(data, dict) and isinstance(data.get("rows"), list) else []
+    raw_data = result.get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
+    raw_rows = data.get("rows")
+    rows = cast(list[Any], raw_rows) if isinstance(raw_rows, list) else []
     row_count = result.get("row_count", len(rows))
     if intent == "metric_value" and rows:
         latest = rows[-1]
