@@ -1,0 +1,20 @@
+# Secrets / runtime state
+.env
+.metabase_agent_memory.json
+.metabase_agent_state.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Tooling / editor
+.claude/
+.sisyphus/
+.playwright-mcp/
+.DS_Store
