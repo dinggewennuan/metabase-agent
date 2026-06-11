@@ -1,82 +1,190 @@
 # Metabase Agent Python
 
-这是一个本地可运行的 Python Metabase Agent。它可以把自然语言问题解析成语义查询流程，支持 Metabase Metric，也支持 BigQuery/MongoDB 表源上的基础聚合查询，并输出回答、执行步骤、Query Plan、Metabase Program 和 Query Result。
+本地可运行的 Python Metabase 分析 Agent。把自然语言问题解析成语义查询流程，支持 Metabase Metric，也支持 BigQuery/MongoDB 表源上的只读聚合与只读 SQL，输出**回答 + 执行 Trace + Query Plan + Metabase Program + Query Result**。
 
-## 1. 安装依赖
+提供两种执行内核：
 
-进入项目目录：
+- **pipeline**（默认）：确定性的规则管道，可完全离线 dry-run，行为可复现。
+- **tools**：LLM 工具循环 Agent，模型自行调用只读工具并综合作答，复用同一套安全闸口。
 
-```bash
-cd /Users/ks/akool/metabase-agent-python
+入口齐全：Web 页面、HTTP API（含 SSE 流式）、CLI。
+
+---
+
+## 目录
+
+- [项目亮点](#项目亮点)
+- [架构](#架构)
+- [执行流程](#执行流程)
+- [安装](#安装)
+- [CLI 命令](#cli-命令)
+- [Web 页面与 API](#web-页面与-api)
+- [配置项](#配置项)
+- [两种执行模式](#两种执行模式)
+- [安全与策略](#安全与策略)
+- [测试](#测试)
+- [部署](#部署)
+- [改进点 / Roadmap](#改进点--roadmap)
+- [常见问题](#常见问题)
+
+---
+
+## 项目亮点
+
+- **双内核**：规则管道（确定、可离线、可测）与 LLM 工具循环（灵活、自主探查）共存，靠 `AGENT_MODE` 一键切换，无 key 自动回退 pipeline。
+- **安全优先**：只读 SQL 校验（字面量/注释/反引号掩码 + 单语句检测 + scripting 黑名单）、查询策略（limit ≤ 200、聚合函数白名单）、**SQL 执行前人工审批**闸口；三个入口（API/SSE/CLI）共用同一套闸口。
+- **全程可观测**：每一步都进 Trace；SSE 逐节点 / 逐工具推送进度，前端实时渲染处理过程。
+- **会话能力**：按 `session_id` 的多轮记忆、待审批 SQL 与表上下文持久化，重启不丢。
+- **多 worker 就绪**：状态后端可插拔，`AGENT_STORE=sqlite`（WAL）让多 worker 共享会话/审批/表上下文，支持 session TTL。
+- **OpenAI 兼容网关友好**：双 wire 协议（`chat_completions` 走 SDK、`responses` 走裸 httpx），适配自建/代理网关。
+- **工程化完备**：167 个单测、ruff、basedpyright 0 错、CI、Dockerfile、`ping` 连通性自检。
+
+---
+
+## 架构
+
+分层模块（`src/metabase_agent/`）：
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ 入口层                                                                 │
+│   cli/app.py        Typer CLI：ask / version / ping / web              │
+│   api/app.py        FastAPI：/、/api/config、/api/sessions、           │
+│                     /api/ask、/api/ask/stream + 内嵌单页前端           │
+│   api/store.py      会话状态后端（SqliteStore，多 worker）             │
+│   api/static/       index.html（对话工作台前端）                       │
+├──────────────────────────────────────────────────────────────────────┤
+│ 编排层 agent/                                                          │
+│   graph.py          LangGraph 管道（pipeline 内核）                    │
+│   tool_loop.py      LLM 工具循环（tools 内核）+ 重复调用检测           │
+│   tools.py          只读工具集 + dispatch（list_*/run_aggregation/run_sql）│
+│   metadata_flow.py  库/表/字段元数据 + 表聚合处理                      │
+│   sql_review.py     SQL 审批/预览/执行意图判定                         │
+│   clarify.py        澄清建议话术                                       │
+│   state.py/trace.py/metadata.py/dry_run.py                            │
+├──────────────────────────────────────────────────────────────────────┤
+│ 语义层 semantics/                                                      │
+│   intent_parser.py  规则意图解析（正则 + 中文词表）                    │
+│   llm_intent.py     LLM 意图分类                                       │
+│   llm_client.py     统一 LLM 访问 + 双 wire 协议 tool-calling transport│
+│   sql_explainer.py  SQL 解读（LLM + 结构化降级）                       │
+│   business_glossary.py 业务术语归一                                    │
+├──────────────────────────────────────────────────────────────────────┤
+│ 查询/策略层                                                            │
+│   query/query_planner.py / query_program_builder.py                  │
+│   query/bigquery_report_sql.py + templates/monthly_usage_report.sql  │
+│   metrics/metric_resolver.py   policy/query_policy.py                 │
+├──────────────────────────────────────────────────────────────────────┤
+│ 外部工具层                                                             │
+│   tools/metabase/client.py   Metabase HTTP 客户端（重试/v2→v1 fallback）│
+├──────────────────────────────────────────────────────────────────────┤
+│ 配置层  config/settings.py（pydantic-settings，读 .env）              │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-安装依赖：
+---
+
+## 执行流程
+
+### pipeline 内核（LangGraph）
+
+```
+question
+  │
+  ▼
+parse ── 规则解析 + （真实模式）LLM 意图分类
+  │
+  ├─ sql_explanation ─→ LLM 解读 / 结构化降级摘要 ─→ END
+  ├─ native_sql ─────→ 只读校验 → 人工审批 → POST /api/dataset ─→ END
+  ├─ bigquery_sql ───→ 月度用量报表 SQL 模板 → 审批 → 执行 ─→ END
+  ├─ database_metadata → 库/表/字段元数据；表聚合走
+  │                      v2 /api/agent/v2/query（404 → v1 construct+execute）─→ END
+  └─ search → inspect → plan → build_program → policy → execute → answer ─→ END
+                                                （Metric 路径：数值/趋势/环比/明细）
+```
+
+### tools 内核（工具循环）
+
+```
+question + 历史
+  │
+  ▼
+┌─────────────────────────────────────────────┐
+│ iter_tool_loop（最多 N 轮，重复调用检测）   │
+│   LLM ─→ 工具调用?                           │
+│     ├─ list_databases / list_tables /        │
+│     │   list_fields / run_aggregation        │ ← 自动执行（只读 + policy）
+│     │      └─ 结果回填 messages，继续循环     │
+│     ├─ run_sql ─→ 挂起，等待人工授权 ────────┼─→ requires_approval
+│     │                （审批后恢复执行）        │
+│     └─ 文本回答 ─────────────────────────────┼─→ completed
+└─────────────────────────────────────────────┘
+```
+
+审批挂起时，完整消息历史写入会话状态（`PENDING_SQL_APPROVALS`，可落 SQLite）；下一次带 `decision=approve` 的请求恢复循环并执行已批 SQL。
+
+---
+
+## 安装
+
+需要 [uv](https://github.com/astral-sh/uv)。
 
 ```bash
 uv sync --extra dev
 ```
 
-## 2. 最方便的页面测试方式
+---
 
-启动本地页面：
+## CLI 命令
 
-```bash
-uv run metabase-agent web
-```
+入口注册为 `metabase-agent`，统一用 `uv run metabase-agent <命令>`。共 4 个命令：
 
-浏览器打开：
-
-```text
-http://127.0.0.1:8765
-```
-
-页面默认状态读取 `.env` 里的 `AGENT_DRY_RUN`。dry-run 本地样例不需要 OpenAI Key 或 Metabase Key；真实模式会读取 `.env`，页面不会展示密钥。
-
-可以输入：
-
-```text
-business_data 下fs_times 最近7天的每天的数据count
-```
-
-点击 `Ask` 后，页面会显示：
-
-- Agent 回答
-- 对话记录和 `session_id`
-- 执行步骤 Trace
-- Query Plan
-- Metabase Program
-- Query Result
-
-## 3. CLI 命令行测试
-
-dry-run 测试：
+| 命令 | 作用 | 关键参数 |
+|---|---|---|
+| `ask` | 单次提问 | `question`（位置，必填）、`--dry-run` |
+| `web` | 启动 Web/API 服务 | `--host`（默认 127.0.0.1）、`--port`（默认 8765） |
+| `ping` | 连通性自检（Metabase + OpenAI 网关） | 无；任一子系统不通则退出码非 0 |
+| `version` | 打印版本号 | 无 |
 
 ```bash
+# 提问（dry-run 离线样例，无需任何 key）
 uv run metabase-agent ask "上周收入趋势怎么样？" --dry-run
-```
-
-表聚合 dry-run 测试：
-
-```bash
 uv run metabase-agent ask "business_data 下orders 最近7天的每天的数据count" --dry-run
-```
 
-查看帮助：
+# 真实模式（需 .env 配好 key、AGENT_DRY_RUN=false）
+uv run metabase-agent ask "查询BigQuery-GA 下business_data都有什么表"
 
-```bash
+# 连通性自检（部署后/换网关时先跑这个）
+uv run metabase-agent ping
+
+# 版本 / 帮助
+uv run metabase-agent version
 uv run metabase-agent --help
 uv run metabase-agent ask --help
 ```
 
-## 4. API 测试
+---
 
-先启动服务：
+## Web 页面与 API
+
+启动：
 
 ```bash
 uv run metabase-agent web
+# 浏览器打开 http://127.0.0.1:8765
 ```
 
-然后另开一个终端请求 API：
+页面展示：Agent 回答、对话记录与 `session_id`、执行 Trace、Query Plan、Metabase Program、Query Result，结果可复制 / 导出 CSV·Excel。
+
+### API 端点
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/` | 单页前端 |
+| GET | `/api/config` | 返回 `default_dry_run` |
+| GET | `/api/sessions/{session_id}` | 读取会话记忆 |
+| POST | `/api/ask` | 同步提问 |
+| POST | `/api/ask/stream` | SSE 流式（逐节点/逐工具进度 + final） |
 
 ```bash
 curl -X POST http://127.0.0.1:8765/api/ask \
@@ -84,175 +192,144 @@ curl -X POST http://127.0.0.1:8765/api/ask \
   -d '{"question":"business_data 下fs_times 最近7天的每天的数据count","dry_run":true,"session_id":"api-demo"}'
 ```
 
-预期会返回包含这些字段的 JSON：
+返回 JSON 含 `answer / query_plan / program / query_result / trace / session_id / memory`。
 
-```json
-{
-  "answer": "...Total Revenue...",
-  "query_plan": {...},
-  "program": {...},
-  "query_result": {...},
-  "trace": [...],
-  "session_id": "api-demo"
-}
-```
-
-连续对话记忆测试：
+连续对话（同一 `session_id` 即可记忆）：
 
 ```bash
-curl -X POST http://127.0.0.1:8765/api/ask \
-  -H "Content-Type: application/json" \
+curl -s -X POST http://127.0.0.1:8765/api/ask -H "Content-Type: application/json" \
   -d '{"question":"上周收入趋势怎么样？","dry_run":true,"session_id":"memory-demo"}'
-
-curl -X POST http://127.0.0.1:8765/api/ask \
-  -H "Content-Type: application/json" \
+curl -s -X POST http://127.0.0.1:8765/api/ask -H "Content-Type: application/json" \
   -d '{"question":"我上次问的内容是什么？","dry_run":true,"session_id":"memory-demo"}'
 ```
 
-## 5. 自动化测试
+配置了 `AGENT_API_TOKEN` 时，`/api/ask`、`/api/ask/stream`、`/api/sessions` 需带 `X-Agent-Token` 头。
 
-运行单元测试：
+---
 
-```bash
-uv run pytest
-```
+## 配置项
 
-编译检查：
-
-```bash
-uv run python -m compileall src tests
-```
-
-当前已覆盖：
-
-- 页面首页加载
-- `/api/ask` dry-run 请求
-- LangGraph dry-run workflow
-- 中文语义解析
-- 会话记忆
-- BigQuery schema 表列表
-- 表级 count/sum/avg/min/max 聚合
-- 最近 N 天时间过滤和按天分组
-- Metric 选择
-- Metric 路径回答合成（数值 / 趋势 / 环比对比 / 明细）
-- Query Program 构造
-- Policy 校验
-- 只读 SQL 策略（拦截写操作与 BigQuery scripting 关键词）
-- 工具循环 Agent（AGENT_MODE=tools）：工具分发、迭代上限、SQL 审批挂起与恢复
-- 双 wire 协议工具调用 transport（chat_completions / responses）
-- 真流式 SSE 逐节点进度事件
-- CLI dry-run 管道与 tools 模式分支
-
-## 6. 使用真实 Metabase / OpenAI
-
-复制环境变量模板：
+复制模板后编辑：
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env`：
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `OPENAI_API_KEY` | 空 | LLM key；空则仅 pipeline + 不调 LLM |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容网关地址 |
+| `OPENAI_MODEL` | `gpt-5` | 模型名 |
+| `OPENAI_WIRE_API` | `chat_completions` | `chat_completions`（SDK）或 `responses`（裸 httpx） |
+| `OPENAI_TIMEOUT` | `120` | LLM 请求超时（秒） |
+| `METABASE_BASE_URL` | 空 | Metabase 实例地址 |
+| `METABASE_API_KEY` | 空 | 只读权限的 Metabase API Key |
+| `AGENT_DRY_RUN` | `true` | true=本地样例（离线、无需 key） |
+| `AGENT_MODE` | `pipeline` | `pipeline` 或 `tools` |
+| `AGENT_API_TOKEN` | 空 | 设置后 /api 需带 `X-Agent-Token` |
+| `AGENT_REQUIRE_TOKEN` | `false` | true 且未配 token 时直接拒绝所有 /api 请求 |
+| `AGENT_STORE` | `memory` | `memory`（单 worker）或 `sqlite`（多 worker） |
+| `AGENT_STATE_PATH` | `.metabase_agent_state.json` | 审批/表上下文文件；sqlite 模式指向 `.db` |
+| `AGENT_MEMORY_PATH` | `.metabase_agent_memory.json` | 会话记忆文件（memory 后端） |
+| `AGENT_SESSION_TTL_SECONDS` | `0` | 会话过期秒数，0=不过期（仅 sqlite） |
+| `METABASE_BIGQUERY_DATABASE_ID` | `19` | BigQuery 库的 Metabase database id |
+| `AGENT_REPORT_RANGE_START` / `_END_EXCLUSIVE` / `_TIMEZONE` | `2025-11-01` / `2026-05-01` / `US/Pacific` | 月度用量报表的时间范围与时区 |
 
-```env
-OPENAI_API_KEY=你的 OpenAI Key
-OPENAI_BASE_URL=https://ai.akool.icu
-OPENAI_MODEL=gpt-5
-OPENAI_WIRE_API=responses
-METABASE_BASE_URL=https://akool.metabaseapp.com
-METABASE_API_KEY=你的 Metabase API Key
-AGENT_DRY_RUN=false
-AGENT_MODE=pipeline
-```
+---
 
-`AGENT_MODE` 控制执行方式：
+## 两种执行模式
 
-- `pipeline`（默认）：固定规则管道，意图解析后路由到对应节点，行为确定、可离线 dry-run。
-- `tools`：LLM 工具循环 Agent，模型自行调用 `list_databases`/`list_tables`/`list_fields`/`run_aggregation`/`run_sql` 等只读工具并综合作答；需要 `OPENAI_API_KEY`，缺 key 时自动回退到 `pipeline`。所有工具仍复用相同的只读 SQL 校验、查询策略和人工审批闸口。
+- **`pipeline`（默认）**：意图解析后路由到固定节点。行为确定、可离线 dry-run、便于测试与审计。
+- **`tools`**：LLM 通过 function calling 自行调用 `list_databases`/`list_tables`/`list_fields`/`run_aggregation`/`run_sql`，拿到结果后综合作答。需要 `OPENAI_API_KEY`；缺 key 或 dry-run 时自动走 pipeline。所有工具复用相同的只读校验、查询策略与人工审批闸口。
 
-如果你使用的是兼容 OpenAI 协议的模型服务，把 `OPENAI_BASE_URL` 改成你的服务地址，例如：
+> dry-run 始终走 pipeline（保证“本地样例、不调 LLM、可复现”），即使 `AGENT_MODE=tools`。
 
-```env
-OPENAI_API_KEY=你的兼容服务 Key
-OPENAI_BASE_URL=https://your-openai-compatible-host/v1
-OPENAI_MODEL=你的模型名
-OPENAI_WIRE_API=responses
-```
+---
 
-然后运行：
+## 安全与策略
 
-```bash
-uv run metabase-agent web
-```
+- **只读 SQL 校验**：必须以 `SELECT`/`WITH` 开头、单语句；对字面量/注释/反引号做掩码后再比对关键词黑名单（`INSERT/UPDATE/DELETE/DROP/...` 及 BigQuery scripting：`CALL/EXECUTE/EXPORT/LOAD/DECLARE`）。
+- **查询策略**（`policy/query_policy.py`）：`limit ≤ 200`、聚合函数白名单、source 类型校验。
+- **人工审批**：生成的 SQL / 结构化查询执行前需显式授权（`decision=approve`）；粘贴新 SQL 不会被误判为对上一条的批准。
+- **鉴权**：`AGENT_API_TOKEN` + 可选 `AGENT_REQUIRE_TOKEN`；真实模式无 token 启动时打印告警。
+- **重试**：Metabase 客户端对 GET/HEAD 在 429/502/503/504 时短暂重试；POST 不自动重试，避免重复执行。
 
-或者：
+---
 
-```bash
-uv run metabase-agent ask "上周收入趋势怎么样？"
-```
-
-真实查询示例：
-
-```bash
-uv run metabase-agent ask "查询BigQuery-GA 下business_data都有什么表"
-uv run metabase-agent ask "查询BigQuery-GA 下business_data 的 usr_users 表有多少条数据？"
-uv run metabase-agent ask "business_data 下fs_times 最近7天的每天的数据count"
-```
-
-注意：本地真实查询需要你的 Metabase API Key 具备对应 Metric/Table 的只读权限。程序会优先尝试 Metabase Agent v2 query；如果当前实例没有 v2 endpoint，会 fallback 到 v1 construct-query + execute。
-
-## 7. 部署运行
-
-开发/内网试用：
+## 测试
 
 ```bash
-uv sync --extra dev
+uv run pytest                       # 167 单测
+uv run ruff check src tests         # lint
+uv run python -m compileall src tests
+```
+
+覆盖范围（节选）：页面加载、`/api/ask` dry-run、LangGraph workflow、中文语义解析、会话记忆、表级聚合、最近 N 天过滤与按天分组、Metric 路径回答合成、只读 SQL 策略、工具循环（分发/迭代上限/重复检测/审批挂起恢复）、双 wire 协议 transport、SSE 流式、CLI（ask/version/ping）、SQLite 状态共享与 TTL。
+
+---
+
+## 部署
+
+开发/内网：
+
+```bash
 uv run metabase-agent web --host 127.0.0.1 --port 8765
 ```
 
-服务化运行可以直接使用 uvicorn：
+服务化（uvicorn）：
 
 ```bash
 uv run uvicorn metabase_agent.api.app:app --host 0.0.0.0 --port 8765
 ```
 
+Docker：
+
+```bash
+docker build -t metabase-agent .
+docker run --env-file .env -p 8765:8765 metabase-agent
+```
+
 建议：
 
-- `.env` 只放在服务器本地，不提交到 git。
-- Metabase API Key 使用只读权限。
-- 内部网络入口加认证或网关限制（生产建议设置 `AGENT_API_TOKEN`）。
-- 如果真实查询偶发 429/502/503/504，客户端会对 GET/HEAD 做短暂重试；POST 不会自动重试，避免重复执行。
-- **状态后端与多 worker**：默认 `AGENT_STORE=memory`（进程内 + 本地 JSON），只适合单 worker；用 `--workers N`（N>1）时审批/会话状态会在进程间分裂。要跑多 worker，设 `AGENT_STORE=sqlite` 并把 `AGENT_STATE_PATH` 指向一个共享的 `.db` 文件（如 `/var/lib/metabase-agent/state.db`），各 worker 通过 SQLite（WAL）共享会话记忆、挂起审批与表上下文；可选 `AGENT_SESSION_TTL_SECONDS` 自动清理过期会话。
-- **Docker**：`docker build -t metabase-agent . && docker run --env-file .env -p 8765:8765 metabase-agent`。
+- `.env` 只放服务器本地，不提交 git；Metabase Key 用只读权限；入口设 `AGENT_API_TOKEN`（生产建议 `AGENT_REQUIRE_TOKEN=true`）。
+- **单 worker（默认）**：`AGENT_STORE=memory`，状态在进程内 + 本地 JSON。
+- **多 worker**：设 `AGENT_STORE=sqlite`，`AGENT_STATE_PATH` 指向共享 `.db`（如 `/var/lib/metabase-agent/state.db`），各 worker 经 SQLite（WAL）共享会话/审批/表上下文；可选 `AGENT_SESSION_TTL_SECONDS` 清理过期会话。
 
-## 8. 常见问题
+---
 
-如果端口被占用，可以换端口：
+## 改进点 / Roadmap
+
+已知限制与后续方向：
+
+- **真实网关 tools 联调**：`/responses` 的 tool-calling 形状按 OpenAI 规范实现，换自建网关后建议先 `uv run metabase-agent ping` 验证连通，再端到端验证 tools 模式。
+- **pipeline 语义解析是正则**：`intent_parser` 依赖中文正则与词表，表述偏差易落入兜底分支；tools 模式是其长期替代。
+- **跨主机多副本**：当前 SQLite 后端覆盖单机多进程；跨主机需要 Redis/外部 DB 后端（`api/store.py` 接口已抽象，可加 `RedisStore`）。
+- **报表为模板驱动的单一报表**：月度 web/api 用量报表是固定模板 + 参数；更多报表建议继续模板化或落成 Metabase saved question。
+- **CLI tools 审批**：CLI 为单次执行，触发 `run_sql` 审批时只打印 SQL，不支持交互式授权（请用 Web 端）。
+- **业务默认值**：`METABASE_BIGQUERY_DATABASE_ID`、报表日期等仍是 akool 部署默认值，开源/换环境前应清空。
+- **CI/Docker 实跑**：CI 工作流与 Dockerfile 已就绪，需推到远端 + 启 Docker daemon 验证。
+
+---
+
+## 常见问题
+
+换端口：
 
 ```bash
 uv run metabase-agent web --port 8766
 ```
 
-如果想停止服务，在启动服务的终端按：
+停止服务：启动终端按 `Ctrl+C`。
 
-```text
-Ctrl+C
-```
-
-如果页面没有返回结果，先用 dry-run 确认本地流程：
+页面无返回，先用 dry-run 确认本地流程：
 
 ```bash
 uv run metabase-agent ask "上周收入趋势怎么样？" --dry-run
 ```
 
-如果真实模式失败，优先检查：
+真实模式失败，优先检查：`.env` 是否存在、`OPENAI_BASE_URL` 是否兼容 `/v1`、`METABASE_BASE_URL`/`METABASE_API_KEY` 是否正确有权限、`AGENT_DRY_RUN=false` 是否设置——或直接 `uv run metabase-agent ping`。
 
-- `.env` 是否存在
-- `OPENAI_BASE_URL` 是否是兼容 OpenAI 协议的 `/v1` 地址
-- `METABASE_BASE_URL` 是否正确
-- `METABASE_API_KEY` 是否有权限
-- `AGENT_DRY_RUN=false` 是否已设置
-
-如果 `business_data 下fs_times 最近7天的每天的数据count` 不能自动选择正确时间字段，可以在问题中补充字段名，例如：
+时间字段选不对时，在问题里补字段名：
 
 ```text
 business_data 下fs_times 最近7天的每天的数据count，时间字段 last_sub_upgrade_time
