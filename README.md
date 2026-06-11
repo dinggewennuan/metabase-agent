@@ -155,7 +155,13 @@ OPENAI_WIRE_API=responses
 METABASE_BASE_URL=https://akool.metabaseapp.com
 METABASE_API_KEY=你的 Metabase API Key
 AGENT_DRY_RUN=false
+AGENT_MODE=pipeline
 ```
+
+`AGENT_MODE` 控制执行方式：
+
+- `pipeline`（默认）：固定规则管道，意图解析后路由到对应节点，行为确定、可离线 dry-run。
+- `tools`：LLM 工具循环 Agent，模型自行调用 `list_databases`/`list_tables`/`list_fields`/`run_aggregation`/`run_sql` 等只读工具并综合作答；需要 `OPENAI_API_KEY`，缺 key 时自动回退到 `pipeline`。所有工具仍复用相同的只读 SQL 校验、查询策略和人工审批闸口。
 
 如果你使用的是兼容 OpenAI 协议的模型服务，把 `OPENAI_BASE_URL` 改成你的服务地址，例如：
 
