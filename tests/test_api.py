@@ -444,3 +444,25 @@ def test_dry_run_forces_pipeline_even_in_tools_mode(monkeypatch: pytest.MonkeyPa
     response = client.post("/api/ask", json={"question": "当前有几个数据库？", "dry_run": True, "session_id": "dry-tools"})
 
     assert response.json()["query_result"]["status"] == "completed"
+
+
+def test_require_token_rejects_when_no_token_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_REQUIRE_TOKEN", "true")
+    monkeypatch.setenv("AGENT_API_TOKEN", "")
+    get_settings.cache_clear()
+    client = TestClient(create_app())
+
+    response = client.post("/api/ask", json={"question": "x", "dry_run": True, "session_id": "rt"})
+
+    assert response.status_code == 401
+
+
+def test_require_token_allows_with_correct_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_REQUIRE_TOKEN", "true")
+    monkeypatch.setenv("AGENT_API_TOKEN", "secret")
+    get_settings.cache_clear()
+    client = TestClient(create_app())
+
+    response = client.post("/api/ask", json={"question": "当前有几个数据库？", "dry_run": True, "session_id": "rt2"}, headers={"X-Agent-Token": "secret"})
+
+    assert response.status_code == 200

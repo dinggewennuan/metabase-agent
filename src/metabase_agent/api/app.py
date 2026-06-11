@@ -430,8 +430,10 @@ def _get_graph(settings: Settings) -> Any:
 
 
 def _check_token(x_agent_token: str | None) -> None:
-    """Enforce X-Agent-Token when AGENT_API_TOKEN is configured; no-op otherwise."""
-    token = get_settings().agent_api_token
+    settings = get_settings()
+    token = settings.agent_api_token
+    if settings.agent_require_token and not token:
+        raise HTTPException(status_code=401, detail="server requires AGENT_API_TOKEN but none is configured")
     if token and x_agent_token != token:
         raise HTTPException(status_code=401, detail="invalid or missing X-Agent-Token")
 

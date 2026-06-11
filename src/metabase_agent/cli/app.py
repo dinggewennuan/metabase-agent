@@ -40,4 +40,10 @@ def ask(question: str, dry_run: bool = typer.Option(False, help="Use determinist
 
 @app.command()
 def web(host: str = "127.0.0.1", port: int = 8765) -> None:
+    settings = get_settings()
+    if not settings.agent_dry_run and not settings.agent_api_token:
+        logging.getLogger("metabase_agent").warning(
+            "running in real mode without AGENT_API_TOKEN: /api endpoints are unauthenticated. "
+            "Set AGENT_API_TOKEN (and AGENT_REQUIRE_TOKEN=true) before exposing beyond localhost."
+        )
     uvicorn.run("metabase_agent.api.app:app", host=host, port=port, reload=False)
