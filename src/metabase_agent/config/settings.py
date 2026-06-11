@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     metabase_base_url: str = Field(default="https://akool.metabaseapp.com", alias="METABASE_BASE_URL")
     metabase_api_key: str = Field(default="", alias="METABASE_API_KEY")
     agent_dry_run: bool = Field(default=True, alias="AGENT_DRY_RUN")
+    agent_mode: str = Field(default="pipeline", alias="AGENT_MODE")
     agent_memory_path: str = Field(default=".metabase_agent_memory.json", alias="AGENT_MEMORY_PATH")
     agent_state_path: str = Field(default=".metabase_agent_state.json", alias="AGENT_STATE_PATH")
     agent_api_token: str = Field(default="", alias="AGENT_API_TOKEN")

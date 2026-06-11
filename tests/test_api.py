@@ -362,3 +362,38 @@ def test_ask_stream_emits_node_status_events() -> None:
     assert "event: final" in body
     assert '"node": "parse"' in body
     assert '"node": "answer"' in body
+
+
+def test_tools_mode_runs_loop_and_returns_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    from metabase_agent.agent.tool_loop import ToolCall
+
+    monkeypatch.setenv("AGENT_MODE", "tools")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    class _Transport:
+        def __init__(self) -> None:
+            self._script = [[ToolCall(id="c1", name="list_databases", arguments={})], "当前有 3 个数据库。"]
+
+        def complete(self, messages, tools):
+            return self._script.pop(0)
+
+    monkeypatch.setattr("metabase_agent.api.app.build_tool_transport", lambda settings: _Transport())
+    client = TestClient(create_app())
+
+    response = client.post("/api/ask", json={"question": "有哪些数据库？", "dry_run": True, "session_id": "tools-1"})
+
+    body = response.json()
+    assert body["answer"] == "当前有 3 个数据库。"
+    assert body["query_result"]["status"] == "completed"
+
+
+def test_tools_mode_falls_back_to_pipeline_without_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_MODE", "tools")
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    get_settings.cache_clear()
+    client = TestClient(create_app())
+
+    response = client.post("/api/ask", json={"question": "当前有几个数据库？", "dry_run": True, "session_id": "tools-2"})
+
+    assert response.json()["query_result"]["status"] == "completed"

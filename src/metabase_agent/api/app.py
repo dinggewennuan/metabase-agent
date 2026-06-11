@@ -13,8 +13,11 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from metabase_agent.agent.graph import build_graph
+from metabase_agent.agent.tool_loop import run_tool_loop
+from metabase_agent.agent.tools import AgentTools
 from metabase_agent.config.settings import Settings, get_settings
 from metabase_agent.query.bigquery_report_sql import extract_native_sql
+from metabase_agent.semantics.llm_client import build_tool_transport
 
 MAX_MEMORY_MESSAGES = 20
 CONVERSATION_MEMORY: dict[str, list[dict[str, str]]] = {}
@@ -314,16 +317,61 @@ def _finalize_ask(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any]
     )
 
 
+def _use_tools(settings: Settings) -> bool:
+    return settings.agent_mode == "tools" and bool(settings.openai_api_key)
+
+
 def _run_ask(payload: AskRequest) -> AskResponse:
     early, run = _prepare_ask(payload)
     if early is not None or run is None:
         return cast(AskResponse, early)
-    graph = _get_graph(get_settings())
+    settings = get_settings()
+    if _use_tools(settings):
+        return _run_ask_tools(payload, run, settings)
+    graph = _get_graph(settings)
     try:
         result = graph.invoke({"question": run.question, "dry_run": run.dry_run, "sql_approved": run.sql_approved})
     except Exception as exc:
         return _failed_ask(payload, exc)
     return _finalize_ask(payload, run, result)
+
+
+def _run_ask_tools(payload: AskRequest, run: _PreparedAsk, settings: Settings) -> AskResponse:
+    tools = AgentTools(settings, dry_run=run.dry_run)
+    transport = build_tool_transport(settings)
+    pending = PENDING_SQL_APPROVALS.get(payload.session_id)
+    try:
+        if run.sql_approved and isinstance(pending, dict) and pending.get("mode") == "tools":
+            outcome = run_tool_loop(
+                "",
+                cast(list[dict[str, Any]], pending.get("messages") or []),
+                transport,
+                tools,
+                approved_sql=str(pending.get("sql") or ""),
+                approved_tool_call_id=str(pending.get("tool_call_id") or ""),
+            )
+        else:
+            outcome = run_tool_loop(run.question, _history(payload.session_id), transport, tools)
+    except Exception as exc:
+        return _failed_ask(payload, exc)
+    if outcome.status == "requires_approval":
+        PENDING_SQL_APPROVALS[payload.session_id] = {"question": run.question, "sql": outcome.pending_sql, "messages": outcome.messages, "tool_call_id": outcome.pending_tool_call_id, "mode": "tools"}
+        query_result: dict[str, Any] = {"status": "requires_approval", "sql": outcome.pending_sql}
+    else:
+        PENDING_SQL_APPROVALS.pop(payload.session_id, None)
+        query_result = outcome.last_result or {"status": outcome.status}
+    _save_state()
+    _remember(payload.session_id, "user", payload.question)
+    memory = _remember(payload.session_id, "assistant", outcome.answer)
+    return AskResponse(
+        answer=outcome.answer,
+        query_plan={"intent": "tool_loop", "status": outcome.status},
+        program=None,
+        query_result=query_result,
+        trace=outcome.trace,
+        session_id=payload.session_id,
+        memory=memory,
+    )
 
 
 def _get_graph(settings: Settings) -> Any:
