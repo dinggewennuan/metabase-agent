@@ -134,8 +134,14 @@ uv run python -m compileall src tests
 - 表级 count/sum/avg/min/max 聚合
 - 最近 N 天时间过滤和按天分组
 - Metric 选择
+- Metric 路径回答合成（数值 / 趋势 / 环比对比 / 明细）
 - Query Program 构造
 - Policy 校验
+- 只读 SQL 策略（拦截写操作与 BigQuery scripting 关键词）
+- 工具循环 Agent（AGENT_MODE=tools）：工具分发、迭代上限、SQL 审批挂起与恢复
+- 双 wire 协议工具调用 transport（chat_completions / responses）
+- 真流式 SSE 逐节点进度事件
+- CLI dry-run 管道与 tools 模式分支
 
 ## 6. 使用真实 Metabase / OpenAI
 
@@ -213,8 +219,10 @@ uv run uvicorn metabase_agent.api.app:app --host 0.0.0.0 --port 8765
 
 - `.env` 只放在服务器本地，不提交到 git。
 - Metabase API Key 使用只读权限。
-- 内部网络入口加认证或网关限制。
+- 内部网络入口加认证或网关限制（生产建议设置 `AGENT_API_TOKEN`）。
 - 如果真实查询偶发 429/502/503/504，客户端会对 GET/HEAD 做短暂重试；POST 不会自动重试，避免重复执行。
+- **单 worker 限制**：会话记忆、挂起的 SQL 审批和表上下文都保存在进程内存 + 本地 JSON 文件中。请用单 worker 运行（默认即是）；若用 `--workers N`（N>1），审批/会话状态会在进程间分裂，导致“在某进程挂起、在另一进程批准”时找不到上下文。多副本部署需先把状态外置到 Redis/数据库。
+- **Docker**：`docker build -t metabase-agent . && docker run --env-file .env -p 8765:8765 metabase-agent`。
 
 ## 8. 常见问题
 
