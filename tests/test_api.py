@@ -364,6 +364,12 @@ def test_ask_stream_emits_node_status_events() -> None:
     assert '"node": "answer"' in body
 
 
+def _offline_tools(settings):
+    from metabase_agent.agent.tools import AgentTools as _AgentTools
+
+    return _AgentTools(settings, dry_run=True)
+
+
 def test_tools_mode_runs_loop_and_returns_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     from metabase_agent.agent.tool_loop import ToolCall
 
@@ -379,9 +385,10 @@ def test_tools_mode_runs_loop_and_returns_answer(monkeypatch: pytest.MonkeyPatch
             return self._script.pop(0)
 
     monkeypatch.setattr("metabase_agent.api.app.build_tool_transport", lambda settings: _Transport())
+    monkeypatch.setattr("metabase_agent.api.app.AgentTools", lambda settings, dry_run: _offline_tools(settings))
     client = TestClient(create_app())
 
-    response = client.post("/api/ask", json={"question": "有哪些数据库？", "dry_run": True, "session_id": "tools-1"})
+    response = client.post("/api/ask", json={"question": "有哪些数据库？", "dry_run": False, "session_id": "tools-1"})
 
     body = response.json()
     assert body["answer"] == "当前有 3 个数据库。"
@@ -413,10 +420,27 @@ def test_tools_mode_stream_uses_tool_loop(monkeypatch: pytest.MonkeyPatch) -> No
             return [ToolCall(id="c1", name="run_aggregation", arguments={"database_name": "BigQuery-GA", "schema_name": "business_data", "table_name": "orders", "aggregation": "count"})]
 
     monkeypatch.setattr("metabase_agent.api.app.build_tool_transport", lambda settings: _Transport())
+    monkeypatch.setattr("metabase_agent.api.app.AgentTools", lambda settings, dry_run: _offline_tools(settings))
     client = TestClient(create_app())
 
-    response = client.post("/api/ask/stream", json={"question": "orders 多少行", "dry_run": True, "session_id": "tools-stream"})
+    response = client.post("/api/ask/stream", json={"question": "orders 多少行", "dry_run": False, "session_id": "tools-stream"})
 
     body = response.text
     assert "工具循环回答" in body
     assert '"rows": [[3]]' in body
+
+
+def test_dry_run_forces_pipeline_even_in_tools_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_MODE", "tools")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def _boom(settings):
+        raise AssertionError("tools transport must not be built during dry-run")
+
+    monkeypatch.setattr("metabase_agent.api.app.build_tool_transport", _boom)
+    client = TestClient(create_app())
+
+    response = client.post("/api/ask", json={"question": "当前有几个数据库？", "dry_run": True, "session_id": "dry-tools"})
+
+    assert response.json()["query_result"]["status"] == "completed"

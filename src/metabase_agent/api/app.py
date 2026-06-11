@@ -249,7 +249,7 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
         ), None
     else:
         question = _fill_table_follow_up(question, PENDING_TABLE_CONTEXT.get(payload.session_id))
-    memory_answer = _answer_from_memory(payload.question, history)
+    memory_answer = None if _use_tools(settings, dry_run) else _answer_from_memory(payload.question, history)
     if memory_answer is not None:
         _remember(payload.session_id, "user", payload.question)
         memory = _remember(payload.session_id, "assistant", memory_answer)
@@ -317,8 +317,8 @@ def _finalize_ask(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any]
     )
 
 
-def _use_tools(settings: Settings) -> bool:
-    return settings.agent_mode == "tools" and bool(settings.openai_api_key)
+def _use_tools(settings: Settings, dry_run: bool) -> bool:
+    return settings.agent_mode == "tools" and bool(settings.openai_api_key) and not dry_run
 
 
 def _run_ask(payload: AskRequest) -> AskResponse:
@@ -326,7 +326,7 @@ def _run_ask(payload: AskRequest) -> AskResponse:
     if early is not None or run is None:
         return cast(AskResponse, early)
     settings = get_settings()
-    if _use_tools(settings):
+    if _use_tools(settings, run.dry_run):
         return _run_ask_tools(payload, run, settings)
     graph = _get_graph(settings)
     try:
@@ -465,7 +465,7 @@ def create_app() -> FastAPI:
                 return
             yield _stream_event("status", {"message": "已授权，正在执行 SQL..." if run.sql_approved else "正在规划查询..."})
             settings = get_settings()
-            if _use_tools(settings):
+            if _use_tools(settings, run.dry_run):
                 yield _stream_event("status", {"message": "Agent 正在调用工具...", "node": "tool_loop"})
                 yield _stream_event("final", _run_ask_tools(payload, run, settings).model_dump())
                 return
