@@ -95,7 +95,10 @@ def tool_schemas() -> list[dict[str, Any]]:
             "description": "执行一条只读 SELECT/WITH SQL。执行前需要用户授权。",
             "parameters": {
                 "type": "object",
-                "properties": {"sql": {"type": "string"}},
+                "properties": {
+                    "sql": {"type": "string"},
+                    "database_name": {"type": "string", "description": "要执行 SQL 的数据库，省略则用默认 BigQuery 库。"},
+                },
                 "required": ["sql"],
             },
         },
@@ -227,6 +230,12 @@ class AgentTools:
             constructed = self.client().construct_query_v1(_table_aggregation_v1_payload(program))
             return self.client().execute_query_v1(constructed)
 
+    def _resolve_database_id(self, database_name: str | None) -> int:
+        if not database_name:
+            return self.bigquery_database_id
+        database = _find_database(self._databases(), database_name)
+        return int(database["id"]) if database and database.get("id") is not None else self.bigquery_database_id
+
     def _run_sql(self, arguments: dict[str, Any]) -> dict[str, Any]:
         sql = extract_native_sql(str(arguments.get("sql") or "")) or str(arguments.get("sql") or "")
         if not sql:
@@ -235,4 +244,5 @@ class AgentTools:
             return {"status": "blocked", "error": "only read-only SELECT/WITH SQL is allowed", "sql": sql}
         if self.dry_run:
             return {"status": "completed", "row_count": 0, "data": {"cols": [], "rows": []}, "dry_run": True, "sql": sql}
-        return {**self.client().execute_native_query(self.bigquery_database_id, sql), "sql": sql}
+        database_id = self._resolve_database_id(arguments.get("database_name"))
+        return {**self.client().execute_native_query(database_id, sql), "sql": sql}

@@ -207,3 +207,42 @@ def test_loop_captures_last_tool_result_for_ui() -> None:
     assert outcome.status == "completed"
     assert outcome.last_result is not None
     assert outcome.last_result["data"]["rows"] == [[3]]
+
+
+def test_run_sql_targets_requested_database_id() -> None:
+    captured: dict[str, Any] = {}
+
+    class _StubClient:
+        def list_databases(self) -> Any:
+            return {"data": [{"id": 7, "name": "warehouse"}, {"id": 19, "name": "BigQuery-GA"}]}
+
+        def execute_native_query(self, database_id: int, sql: str) -> dict[str, Any]:
+            captured["database_id"] = database_id
+            return {"status": "completed", "row_count": 0, "data": {"cols": [], "rows": []}}
+
+    tools = AgentTools(Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="k"), dry_run=False)
+    tools._client = _StubClient()  # type: ignore[assignment]
+
+    result = tools.dispatch("run_sql", {"sql": "SELECT 1", "database_name": "warehouse"})
+
+    assert result["status"] == "completed"
+    assert captured["database_id"] == 7
+
+
+def test_run_sql_defaults_to_bigquery_database_id() -> None:
+    captured: dict[str, Any] = {}
+
+    class _StubClient:
+        def list_databases(self) -> Any:
+            return {"data": [{"id": 19, "name": "BigQuery-GA"}]}
+
+        def execute_native_query(self, database_id: int, sql: str) -> dict[str, Any]:
+            captured["database_id"] = database_id
+            return {"status": "completed", "row_count": 0, "data": {"cols": [], "rows": []}}
+
+    tools = AgentTools(Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="k", METABASE_BIGQUERY_DATABASE_ID=19), dry_run=False)
+    tools._client = _StubClient()  # type: ignore[assignment]
+
+    tools.dispatch("run_sql", {"sql": "SELECT 1"})
+
+    assert captured["database_id"] == 19
