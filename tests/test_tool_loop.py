@@ -246,3 +246,59 @@ def test_run_sql_defaults_to_bigquery_database_id() -> None:
     tools.dispatch("run_sql", {"sql": "SELECT 1"})
 
     assert captured["database_id"] == 19
+
+
+def test_agent_tools_reuse_cached_metabase_client() -> None:
+    from metabase_agent.agent.tools import _client_cache
+
+    _client_cache.clear()
+    settings = Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="k", METABASE_BASE_URL="https://mb.test")
+    a = AgentTools(settings, dry_run=False)
+    b = AgentTools(settings, dry_run=False)
+
+    assert a.client() is b.client()
+
+
+class _CountingTools:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls += 1
+        return {"status": "completed", "databases": ["a"]}
+
+
+def test_loop_detects_repeated_identical_tool_call() -> None:
+    transport = _ScriptedTransport(
+        [
+            [ToolCall(id="c1", name="list_databases", arguments={})],
+            [ToolCall(id="c2", name="list_databases", arguments={})],
+            "完成。",
+        ]
+    )
+    tools = _CountingTools()
+
+    outcome = run_tool_loop("q", [], transport, tools)
+
+    assert tools.calls == 1
+    assert any(event.get("step") == "tool.repeated" for event in outcome.trace)
+    assert outcome.answer == "完成。"
+
+
+def test_iter_tool_loop_streams_events_then_outcome() -> None:
+    from metabase_agent.agent.tool_loop import LoopOutcome, iter_tool_loop
+
+    transport = _ScriptedTransport(
+        [
+            [ToolCall(id="c1", name="list_databases", arguments={})],
+            "有 3 个库。",
+        ]
+    )
+
+    events = list(iter_tool_loop("有哪些库？", [], transport, _tools()))
+
+    kinds = [kind for kind, _ in events]
+    assert "trace" in kinds
+    assert kinds[-1] == "outcome"
+    assert isinstance(events[-1][1], LoopOutcome)
+    assert events[-1][1].answer == "有 3 个库。"

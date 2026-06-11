@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -54,8 +55,34 @@ def run_tool_loop(
     approved_sql: str | None = None,
     approved_tool_call_id: str | None = None,
 ) -> LoopOutcome:
+    outcome = LoopOutcome(status="exhausted")
+    for kind, payload in iter_tool_loop(
+        question,
+        history,
+        transport,
+        tools,
+        max_iterations=max_iterations,
+        approved_sql=approved_sql,
+        approved_tool_call_id=approved_tool_call_id,
+    ):
+        if kind == "outcome":
+            outcome = payload
+    return outcome
+
+
+def iter_tool_loop(
+    question: str,
+    history: list[dict[str, Any]],
+    transport: LLMTransport,
+    tools: AgentTools,
+    *,
+    max_iterations: int = 6,
+    approved_sql: str | None = None,
+    approved_tool_call_id: str | None = None,
+) -> Iterator[tuple[str, Any]]:
     schemas = tool_schemas()
     last_result: dict[str, Any] | None = None
+    seen_calls: set[str] = set()
     if approved_sql is not None:
         messages = list(history)
         last_result = tools.dispatch("run_sql", {"sql": approved_sql})
@@ -69,14 +96,17 @@ def run_tool_loop(
         reply = transport.complete(messages, schemas)
         if isinstance(reply, str):
             messages.append({"role": "assistant", "content": reply})
-            return LoopOutcome(status="completed", answer=reply, trace=trace, messages=messages, last_result=last_result)
+            yield "outcome", LoopOutcome(status="completed", answer=reply, trace=trace, messages=messages, last_result=last_result)
+            return
 
         messages.append({"role": "assistant", "content": "", "tool_calls": [_serialize_call(call) for call in reply]})
         for call in reply:
-            trace.append({"step": "tool.call", "tool": call.name, "arguments": call.arguments})
+            call_event = {"step": "tool.call", "tool": call.name, "arguments": call.arguments}
+            trace.append(call_event)
+            yield "trace", call_event
             if call.name == "run_sql":
                 sql = str(call.arguments.get("sql") or "")
-                return LoopOutcome(
+                yield "outcome", LoopOutcome(
                     status="requires_approval",
                     answer="请先 review 这条 SQL，确认后授权执行，或拒绝本次执行。",
                     trace=trace,
@@ -84,12 +114,27 @@ def run_tool_loop(
                     pending_sql=sql,
                     pending_tool_call_id=call.id,
                 )
-            result = tools.dispatch(call.name, call.arguments)
-            last_result = result
-            trace.append({"step": "tool.result", "tool": call.name, "status": result.get("status")})
+                return
+            signature = _call_signature(call)
+            if signature in seen_calls:
+                result: dict[str, Any] = {"status": "error", "error": "repeated identical tool call ignored; change arguments or answer with what you have"}
+                repeat_event = {"step": "tool.repeated", "tool": call.name}
+                trace.append(repeat_event)
+                yield "trace", repeat_event
+            else:
+                seen_calls.add(signature)
+                result = tools.dispatch(call.name, call.arguments)
+                last_result = result
+            result_event = {"step": "tool.result", "tool": call.name, "status": result.get("status")}
+            trace.append(result_event)
+            yield "trace", result_event
             messages.append(_tool_result_message(call.id, call.name, result))
 
-    return LoopOutcome(status="exhausted", answer="未能在限定步数内完成查询，请缩小问题范围或补充条件。", trace=trace, messages=messages, last_result=last_result)
+    yield "outcome", LoopOutcome(status="exhausted", answer="未能在限定步数内完成查询，请缩小问题范围或补充条件。", trace=trace, messages=messages, last_result=last_result)
+
+
+def _call_signature(call: ToolCall) -> str:
+    return f"{call.name}:{json.dumps(call.arguments, ensure_ascii=False, sort_keys=True)}"
 
 
 def _serialize_call(call: ToolCall) -> dict[str, Any]:
