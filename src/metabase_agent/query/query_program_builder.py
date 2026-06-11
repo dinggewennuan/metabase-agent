@@ -39,7 +39,7 @@ def build_program(plan: QueryPlan | dict[str, Any], inspected_entity: dict[str, 
     if inspected_entity:
         default_time_field = inspected_entity.get("default_time_dimension_field_id")
 
-    if plan.get("intent") == "metric_trend" and default_time_field:
+    if plan.get("intent") in {"metric_trend", "comparison"} and default_time_field:
         operations.insert(0, ["breakout", ["with-temporal-bucket", ["field", default_time_field], plan.get("time_grain") or "day"]])
 
     return {

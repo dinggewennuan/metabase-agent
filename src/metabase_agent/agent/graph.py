@@ -47,6 +47,30 @@ from metabase_agent.tools.metabase.client import MetabaseClient
 _logger = logging.getLogger("metabase_agent")
 
 
+def _metric_answer(intent: str, source_name: str, result: dict[str, Any]) -> str:
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    rows = data.get("rows") if isinstance(data, dict) and isinstance(data.get("rows"), list) else []
+    row_count = result.get("row_count", len(rows))
+    if intent == "metric_value" and rows:
+        latest = rows[-1]
+        if isinstance(latest, list) and latest:
+            label = f"（{latest[0]}）" if len(latest) > 1 else ""
+            return f"`{source_name}` 当前值为 {latest[-1]}{label}。"
+    if intent == "comparison" and len(rows) >= 2:
+        previous, current = rows[-2], rows[-1]
+        if isinstance(previous, list) and isinstance(current, list) and isinstance(previous[-1], (int, float)) and isinstance(current[-1], (int, float)):
+            delta = current[-1] - previous[-1]
+            pct = f"，环比 {delta / previous[-1] * 100:+.1f}%" if previous[-1] else ""
+            return f"`{source_name}` 对比：{previous[0]} 为 {previous[-1]}，{current[0]} 为 {current[-1]}，变化 {delta:+g}{pct}。"
+    if intent == "metric_trend" and rows:
+        first, last = rows[0], rows[-1]
+        if isinstance(first, list) and isinstance(last, list):
+            return f"`{source_name}` 趋势共 {len(rows)} 个数据点：{first[0]} 为 {first[-1]}，最新 {last[0]} 为 {last[-1]}。"
+    if intent == "detail_lookup":
+        return f"已返回 `{source_name}` 的 {row_count} 行明细。"
+    return f"已基于 Metabase Metric `{source_name}` 完成查询，返回 {row_count} 行。"
+
+
 def build_graph(settings: Settings):
     client = MetabaseClient(settings.metabase_base_url, settings.metabase_api_key)
     bigquery_database_id = settings.metabase_bigquery_database_id
@@ -259,9 +283,7 @@ def build_graph(settings: Settings):
             return {"answer": str(result.get("approval_prompt") or "请先 review 并授权执行该查询。")}
         if result.get("status") != "completed":
             return {"answer": f"查询未完成：{result.get('error', result.get('status'))}"}
-        return {
-            "answer": f"已基于 Metabase Metric `{query_plan.get('source_name', '')}` 完成查询，返回 {result.get('row_count', 0)} 行。"
-        }
+        return {"answer": _metric_answer(str(query_plan.get("intent") or ""), str(query_plan.get("source_name", "")), result)}
 
     graph = StateGraph(AgentState)
     graph.add_node("parse", parse_node)

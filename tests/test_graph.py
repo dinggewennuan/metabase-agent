@@ -578,3 +578,43 @@ def test_graph_blocks_non_read_only_native_sql() -> None:
     result = graph.invoke({"question": "DROP TABLE users", "dry_run": True})
 
     assert result["query_result"]["status"] != "completed"
+
+
+def test_metric_value_answer_surfaces_latest_value() -> None:
+    graph = build_graph(Settings(AGENT_DRY_RUN=True))
+
+    result = graph.invoke({"question": "总收入是多少", "dry_run": True})
+
+    assert result["parsed_intent"]["intent"] == "metric_value"
+    assert "120" in result["answer"]
+    assert "2026-05-08" in result["answer"]
+
+
+def test_metric_trend_answer_summarizes_series() -> None:
+    graph = build_graph(Settings(AGENT_DRY_RUN=True))
+
+    result = graph.invoke({"question": "上周收入趋势怎么样？", "dry_run": True})
+
+    assert "趋势" in result["answer"]
+    assert "100" in result["answer"]
+    assert "120" in result["answer"]
+
+
+def test_comparison_builds_breakout_and_compares_buckets() -> None:
+    graph = build_graph(Settings(AGENT_DRY_RUN=True))
+
+    result = graph.invoke({"question": "对比一下收入", "dry_run": True})
+
+    assert result["parsed_intent"]["intent"] == "comparison"
+    assert ["breakout", ["with-temporal-bucket", ["field", 305], "day"]] in result["program"]["operations"]
+    assert "+20" in result["answer"]
+    assert "20.0%" in result["answer"]
+
+
+def test_detail_lookup_answer_reports_row_count() -> None:
+    from metabase_agent.agent.graph import _metric_answer
+
+    answer = _metric_answer("detail_lookup", "Total Revenue", {"status": "completed", "row_count": 2, "data": {"rows": [[1], [2]]}})
+
+    assert "2" in answer
+    assert "明细" in answer
