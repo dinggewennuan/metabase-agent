@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from metabase_agent.config.settings import Settings
-from metabase_agent.semantics.sql_explainer import explain_sql_with_llm, structural_sql_summary
-
+from metabase_agent.semantics.sql_explainer import (
+    explain_sql_with_llm,
+    structural_sql_summary,
+)
 
 HOURLY_ACTIVE_USERS_SQL = """SELECT
   TIMESTAMP_TRUNC(create_time, HOUR, 'US/Pacific') AS hour,

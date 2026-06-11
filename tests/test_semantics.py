@@ -1,4 +1,8 @@
-from metabase_agent.semantics.intent_parser import is_safe_rule_intent_override, parse_intent, wants_sql_explanation
+from metabase_agent.semantics.intent_parser import (
+    is_safe_rule_intent_override,
+    parse_intent,
+    wants_sql_explanation,
+)
 
 
 def test_parse_chinese_revenue_trend() -> None:

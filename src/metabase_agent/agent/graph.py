@@ -5,8 +5,20 @@ from typing import Any, Mapping, cast
 import httpx
 from langgraph.graph import END, START, StateGraph
 
-from metabase_agent.agent.clarify import _database_clarification_suggestions, _table_candidate_suggestions, _table_clarification_suggestions
-from metabase_agent.agent.dry_run import _dry_databases, _dry_metric, _dry_result, _dry_search, _dry_table_fields, _dry_table_query_metadata, _dry_tables
+from metabase_agent.agent.clarify import (
+    _database_clarification_suggestions,
+    _table_candidate_suggestions,
+    _table_clarification_suggestions,
+)
+from metabase_agent.agent.dry_run import (
+    _dry_databases,
+    _dry_metric,
+    _dry_result,
+    _dry_search,
+    _dry_table_fields,
+    _dry_table_query_metadata,
+    _dry_tables,
+)
 from metabase_agent.agent.metadata import (
     _database_items,
     _database_names,
@@ -38,12 +50,27 @@ from metabase_agent.agent.trace import append_trace as _append_trace
 from metabase_agent.config.settings import Settings
 from metabase_agent.metrics.metric_resolver import choose_metric
 from metabase_agent.policy.query_policy import check_program
-from metabase_agent.query.bigquery_report_sql import build_monthly_usage_report_sql, extract_native_sql, is_read_only_sql
+from metabase_agent.query.bigquery_report_sql import (
+    build_monthly_usage_report_sql,
+    extract_native_sql,
+    is_read_only_sql,
+)
 from metabase_agent.query.query_planner import build_query_plan
-from metabase_agent.query.query_program_builder import _table_aggregation_v1_payload, build_program, build_table_aggregation_program
-from metabase_agent.semantics.intent_parser import is_safe_rule_intent_override, parse_intent, wants_sql_explanation
+from metabase_agent.query.query_program_builder import (
+    _table_aggregation_v1_payload,
+    build_program,
+    build_table_aggregation_program,
+)
+from metabase_agent.semantics.intent_parser import (
+    is_safe_rule_intent_override,
+    parse_intent,
+    wants_sql_explanation,
+)
 from metabase_agent.semantics.llm_intent import parse_intent_with_llm
-from metabase_agent.semantics.sql_explainer import explain_sql_with_llm, structural_sql_summary
+from metabase_agent.semantics.sql_explainer import (
+    explain_sql_with_llm,
+    structural_sql_summary,
+)
 from metabase_agent.tools.metabase.client import MetabaseClient
 
 

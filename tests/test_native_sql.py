@@ -1,4 +1,8 @@
-from metabase_agent.query.bigquery_report_sql import extract_native_sql, is_read_only_sql, normalize_bigquery_sql
+from metabase_agent.query.bigquery_report_sql import (
+    extract_native_sql,
+    is_read_only_sql,
+    normalize_bigquery_sql,
+)
 
 
 def test_extract_native_sql_from_plain_text() -> None:

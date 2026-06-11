@@ -10,7 +10,6 @@ from openai.types.chat import ChatCompletionMessageParam
 from metabase_agent.config.settings import Settings
 from metabase_agent.semantics.llm_intent import _reasoning_effort
 
-
 _SYSTEM_PROMPT = (
     "你是资深的数据分析与 SQL 审查专家。只针对用户给出的这条 SQL 进行分析，"
     "绝不编造 SQL 中不存在的表、字段或业务含义。用中文分点输出：\n"

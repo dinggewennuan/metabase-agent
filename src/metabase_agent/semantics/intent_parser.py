@@ -6,7 +6,6 @@ from typing import Literal, TypedDict
 from metabase_agent.query.bigquery_report_sql import extract_native_sql
 from metabase_agent.semantics.business_glossary import normalize_business_terms
 
-
 Intent = Literal[
     "database_count",
     "database_list",

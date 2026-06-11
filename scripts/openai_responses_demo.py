@@ -10,7 +10,6 @@ from openai.types.shared_params.reasoning import Reasoning
 
 from metabase_agent.config.settings import get_settings
 
-
 ReasoningEffort = Literal["high", "xhigh"]
 
 

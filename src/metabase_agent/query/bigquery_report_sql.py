@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 
-
 FORBIDDEN_SQL_WORDS = {
     "ALTER",
     "CREATE",

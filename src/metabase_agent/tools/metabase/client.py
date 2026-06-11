@@ -6,7 +6,6 @@ from typing import Any
 
 import httpx
 
-
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 RETRYABLE_METHODS = {"GET", "HEAD"}
 

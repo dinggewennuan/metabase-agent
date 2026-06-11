@@ -14,7 +14,6 @@ from metabase_agent.agent.graph import build_graph
 from metabase_agent.config.settings import Settings, get_settings
 from metabase_agent.query.bigquery_report_sql import extract_native_sql
 
-
 MAX_MEMORY_MESSAGES = 20
 CONVERSATION_MEMORY: dict[str, list[dict[str, str]]] = {}
 PENDING_SQL_APPROVALS: dict[str, dict[str, Any]] = {}

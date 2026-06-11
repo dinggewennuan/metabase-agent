@@ -1,4 +1,7 @@
-from metabase_agent.semantics.llm_intent import _parse_responses_payload, _reasoning_effort
+from metabase_agent.semantics.llm_intent import (
+    _parse_responses_payload,
+    _reasoning_effort,
+)
 
 
 def test_parse_responses_payload_normalizes_intent() -> None:

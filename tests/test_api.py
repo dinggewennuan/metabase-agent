@@ -2,10 +2,17 @@ import json
 import threading
 import time
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
-from metabase_agent.api.app import _GRAPH_CACHE, CONVERSATION_MEMORY, PENDING_SQL_APPROVALS, PENDING_TABLE_CONTEXT, _remember, create_app
+from metabase_agent.api.app import (
+    _GRAPH_CACHE,
+    CONVERSATION_MEMORY,
+    PENDING_SQL_APPROVALS,
+    PENDING_TABLE_CONTEXT,
+    _remember,
+    create_app,
+)
 
 
 @pytest.fixture(autouse=True)
