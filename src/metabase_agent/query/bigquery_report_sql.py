@@ -4,11 +4,16 @@ import re
 
 FORBIDDEN_SQL_WORDS = {
     "ALTER",
+    "CALL",
     "CREATE",
+    "DECLARE",
     "DELETE",
     "DROP",
+    "EXECUTE",
+    "EXPORT",
     "GRANT",
     "INSERT",
+    "LOAD",
     "MERGE",
     "REPLACE",
     "REVOKE",

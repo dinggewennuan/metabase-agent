@@ -94,3 +94,11 @@ def test_normalize_bigquery_sql_quotes_metabase_style_table_paths() -> None:
     sql = normalize_bigquery_sql("SELECT business_data.fs_results.createdAt FROM business_data.fs_results WHERE business_data.fs_results.faceswap_status = 3")
 
     assert sql == "SELECT `business_data.fs_results`.createdAt FROM `business_data.fs_results` WHERE `business_data.fs_results`.faceswap_status = 3"
+
+
+def test_read_only_sql_blocks_bigquery_scripting_and_export() -> None:
+    assert is_read_only_sql("CALL my_dataset.my_procedure()") is False
+    assert is_read_only_sql("EXPORT DATA OPTIONS(uri='gs://x/*') AS SELECT 1") is False
+    assert is_read_only_sql("LOAD DATA INTO t FROM FILES(uris=['gs://x'])") is False
+    assert is_read_only_sql("SELECT 1; EXECUTE IMMEDIATE 'DROP TABLE users'") is False
+    assert is_read_only_sql("WITH x AS (SELECT 1) SELECT * FROM x; CALL p()") is False
