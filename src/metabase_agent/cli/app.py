@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import typer
 import uvicorn
@@ -14,6 +15,7 @@ app = typer.Typer(help="Metabase semantic analytics agent")
 @app.callback()
 def main() -> None:
     """Metabase semantic analytics agent."""
+    logging.basicConfig(level=logging.INFO, format="[metabase-agent] %(message)s")
 
 
 @app.command()

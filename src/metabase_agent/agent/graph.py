@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Mapping, cast
 
 import httpx
@@ -73,6 +74,8 @@ from metabase_agent.semantics.sql_explainer import (
 )
 from metabase_agent.tools.metabase.client import MetabaseClient
 
+_logger = logging.getLogger("metabase_agent")
+
 
 def build_graph(settings: Settings):
     client = MetabaseClient(settings.metabase_base_url, settings.metabase_api_key)
@@ -86,7 +89,7 @@ def build_graph(settings: Settings):
             try:
                 return explain_sql_with_llm(sql, settings)
             except Exception as exc:
-                print(f"[metabase-agent] sql.explain.llm failed, using structural summary: {exc}")
+                _logger.warning("sql.explain.llm failed, using structural summary: %s", exc)
         return structural_sql_summary(sql)
 
     def parse_node(state: AgentState) -> AgentState:
