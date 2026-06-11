@@ -464,7 +464,12 @@ def create_app() -> FastAPI:
                 yield _stream_event("final", cast(AskResponse, early).model_dump())
                 return
             yield _stream_event("status", {"message": "已授权，正在执行 SQL..." if run.sql_approved else "正在规划查询..."})
-            graph = _get_graph(get_settings())
+            settings = get_settings()
+            if _use_tools(settings):
+                yield _stream_event("status", {"message": "Agent 正在调用工具...", "node": "tool_loop"})
+                yield _stream_event("final", _run_ask_tools(payload, run, settings).model_dump())
+                return
+            graph = _get_graph(settings)
             result: dict[str, Any] = {}
             try:
                 for chunk in graph.stream({"question": run.question, "dry_run": run.dry_run, "sql_approved": run.sql_approved}, stream_mode="updates"):

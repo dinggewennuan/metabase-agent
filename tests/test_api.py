@@ -397,3 +397,26 @@ def test_tools_mode_falls_back_to_pipeline_without_key(monkeypatch: pytest.Monke
     response = client.post("/api/ask", json={"question": "当前有几个数据库？", "dry_run": True, "session_id": "tools-2"})
 
     assert response.json()["query_result"]["status"] == "completed"
+
+
+def test_tools_mode_stream_uses_tool_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    from metabase_agent.agent.tool_loop import ToolCall
+
+    monkeypatch.setenv("AGENT_MODE", "tools")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    class _Transport:
+        def complete(self, messages, tools):
+            if any(m.get("role") == "tool" for m in messages):
+                return "工具循环回答：3 行。"
+            return [ToolCall(id="c1", name="run_aggregation", arguments={"database_name": "BigQuery-GA", "schema_name": "business_data", "table_name": "orders", "aggregation": "count"})]
+
+    monkeypatch.setattr("metabase_agent.api.app.build_tool_transport", lambda settings: _Transport())
+    client = TestClient(create_app())
+
+    response = client.post("/api/ask/stream", json={"question": "orders 多少行", "dry_run": True, "session_id": "tools-stream"})
+
+    body = response.text
+    assert "工具循环回答" in body
+    assert '"rows": [[3]]' in body
