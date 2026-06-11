@@ -4,8 +4,9 @@ import hashlib
 import json
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -209,9 +210,15 @@ def _fill_table_follow_up(question: str, context: dict[str, Any] | None) -> str:
     return f"{prefix} {question}"
 
 
-def _run_ask(payload: AskRequest) -> AskResponse:
+@dataclass
+class _PreparedAsk:
+    question: str
+    dry_run: bool
+    sql_approved: bool
+
+
+def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk | None]:
     settings = get_settings()
-    graph = _get_graph(settings)
     dry_run = settings.agent_dry_run if payload.dry_run is None else payload.dry_run
     _load_memory()
     _load_state()
@@ -236,7 +243,7 @@ def _run_ask(payload: AskRequest) -> AskResponse:
             trace=[{"step": "sql.review", "status": "rejected"}],
             session_id=payload.session_id,
             memory=memory,
-        )
+        ), None
     else:
         question = _fill_table_follow_up(question, PENDING_TABLE_CONTEXT.get(payload.session_id))
     memory_answer = _answer_from_memory(payload.question, history)
@@ -251,26 +258,30 @@ def _run_ask(payload: AskRequest) -> AskResponse:
             trace=[{"step": "memory.lookup", "status": "completed"}],
             session_id=payload.session_id,
             memory=memory,
-        )
-    try:
-        result = graph.invoke({"question": question, "dry_run": dry_run, "sql_approved": sql_approved})
-    except Exception as exc:
-        _remember(payload.session_id, "user", payload.question)
-        memory = _remember(payload.session_id, "assistant", f"查询失败：{exc}")
-        return AskResponse(
-            answer=f"查询失败：{exc}",
-            query_plan=None,
-            program=None,
-            query_result={"status": "failed", "error": str(exc)},
-            trace=[{"step": "api.ask", "status": "failed", "error": str(exc)}],
-            session_id=payload.session_id,
-            memory=memory,
-        )
+        ), None
+    return None, _PreparedAsk(question=question, dry_run=dry_run, sql_approved=sql_approved)
+
+
+def _failed_ask(payload: AskRequest, exc: Exception) -> AskResponse:
+    _remember(payload.session_id, "user", payload.question)
+    memory = _remember(payload.session_id, "assistant", f"查询失败：{exc}")
+    return AskResponse(
+        answer=f"查询失败：{exc}",
+        query_plan=None,
+        program=None,
+        query_result={"status": "failed", "error": str(exc)},
+        trace=[{"step": "api.ask", "status": "failed", "error": str(exc)}],
+        session_id=payload.session_id,
+        memory=memory,
+    )
+
+
+def _finalize_ask(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any]) -> AskResponse:
     answer = str(result.get("answer", ""))
     query_result = result.get("query_result")
     if isinstance(query_result, dict) and query_result.get("status") == "requires_approval":
-        PENDING_SQL_APPROVALS[payload.session_id] = {"question": question, "sql": query_result.get("sql")}
-    elif sql_approved:
+        PENDING_SQL_APPROVALS[payload.session_id] = {"question": run.question, "sql": query_result.get("sql")}
+    elif run.sql_approved:
         PENDING_SQL_APPROVALS.pop(payload.session_id, None)
     if isinstance(query_result, dict):
         query_plan = result.get("query_plan")
@@ -301,6 +312,18 @@ def _run_ask(payload: AskRequest) -> AskResponse:
         session_id=payload.session_id,
         memory=memory,
     )
+
+
+def _run_ask(payload: AskRequest) -> AskResponse:
+    early, run = _prepare_ask(payload)
+    if early is not None or run is None:
+        return cast(AskResponse, early)
+    graph = _get_graph(get_settings())
+    try:
+        result = graph.invoke({"question": run.question, "dry_run": run.dry_run, "sql_approved": run.sql_approved})
+    except Exception as exc:
+        return _failed_ask(payload, exc)
+    return _finalize_ask(payload, run, result)
 
 
 def _get_graph(settings: Settings) -> Any:
@@ -334,6 +357,22 @@ def _check_token(x_agent_token: str | None) -> None:
     token = get_settings().agent_api_token
     if token and x_agent_token != token:
         raise HTTPException(status_code=401, detail="invalid or missing X-Agent-Token")
+
+
+_NODE_LABELS = {
+    "parse": "已解析意图",
+    "sql_explanation": "已生成 SQL 解读",
+    "native_sql": "已处理 SQL 请求",
+    "bigquery_sql": "已生成报表 SQL",
+    "database_metadata": "已查询元数据",
+    "search": "已搜索相关 Metric",
+    "inspect": "已读取 Metric 详情",
+    "plan": "已生成 Query Plan",
+    "build_program": "已构建查询 Program",
+    "policy": "已通过策略校验",
+    "execute": "已执行查询",
+    "answer": "已生成回答",
+}
 
 
 def _stream_event(name: str, payload: dict[str, Any]) -> str:
@@ -372,13 +411,22 @@ def create_app() -> FastAPI:
 
         def events() -> Any:
             yield _stream_event("status", {"message": "正在解析问题..."})
-            if PENDING_SQL_APPROVALS.get(payload.session_id) and _is_sql_approval(payload.question, payload.decision):
-                yield _stream_event("status", {"message": "已授权，正在执行 SQL..."})
-            elif PENDING_SQL_APPROVALS.get(payload.session_id) and _is_sql_rejection(payload.question, payload.decision):
-                yield _stream_event("status", {"message": "正在拒绝本次执行..."})
-            else:
-                yield _stream_event("status", {"message": "正在规划查询..."})
-            data = _run_ask(payload).model_dump()
+            early, run = _prepare_ask(payload)
+            if early is not None or run is None:
+                yield _stream_event("final", cast(AskResponse, early).model_dump())
+                return
+            yield _stream_event("status", {"message": "已授权，正在执行 SQL..." if run.sql_approved else "正在规划查询..."})
+            graph = _get_graph(get_settings())
+            result: dict[str, Any] = {}
+            try:
+                for chunk in graph.stream({"question": run.question, "dry_run": run.dry_run, "sql_approved": run.sql_approved}, stream_mode="updates"):
+                    for node, delta in chunk.items():
+                        if isinstance(delta, dict):
+                            result.update(delta)
+                        yield _stream_event("status", {"message": _NODE_LABELS.get(node, node), "node": node})
+                data = _finalize_ask(payload, run, result).model_dump()
+            except Exception as exc:
+                data = _failed_ask(payload, exc).model_dump()
             yield _stream_event("final", data)
 
         return StreamingResponse(events(), media_type="text/event-stream")

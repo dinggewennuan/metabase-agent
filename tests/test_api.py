@@ -351,3 +351,14 @@ def test_ask_api_uses_previous_successful_table_for_follow_up() -> None:
     assert data["query_plan"]["table_name"] == "orders"
     assert data["query_plan"]["schema_name"] == "business_data"
     assert data["query_result"]["status"] == "requires_approval"
+
+
+def test_ask_stream_emits_node_status_events() -> None:
+    client = TestClient(create_app())
+
+    response = client.post("/api/ask/stream", json={"question": "上周收入趋势怎么样？", "dry_run": True, "session_id": "stream-nodes"})
+
+    body = response.text
+    assert "event: final" in body
+    assert '"node": "parse"' in body
+    assert '"node": "answer"' in body
