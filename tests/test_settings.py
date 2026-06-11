@@ -24,3 +24,15 @@ def test_get_settings_is_cached() -> None:
 
     get_settings.cache_clear()
     assert get_settings() is get_settings()
+
+
+def test_metabase_base_url_default_is_neutral() -> None:
+    from metabase_agent.config.settings import Settings
+
+    assert Settings(_env_file=None).metabase_base_url == ""
+
+
+def test_require_token_defaults_false() -> None:
+    from metabase_agent.config.settings import Settings
+
+    assert Settings(_env_file=None).agent_require_token is False
