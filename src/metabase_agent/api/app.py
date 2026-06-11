@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -21,7 +22,7 @@ PENDING_TABLE_CONTEXT: dict[str, dict[str, Any]] = {}
 MEMORY_LOADED = False
 STATE_LOADED = False
 _STATE_LOCK = threading.RLock()  # guards the in-memory dicts and on-disk writes
-_GRAPH_CACHE: dict[tuple[str, ...], Any] = {}  # compiled graph reused across requests
+_GRAPH_CACHE: dict[str, Any] = {}  # compiled graph reused across requests
 
 
 class AskRequest(BaseModel):
@@ -308,14 +309,18 @@ def _get_graph(settings: Settings) -> Any:
     Previously every request rebuilt the graph and a fresh MetabaseClient; the
     cache keeps a single compiled graph (and its connection-pooled client) alive.
     """
-    key = (
-        settings.metabase_base_url,
-        settings.metabase_api_key,
-        settings.openai_api_key,
-        settings.openai_base_url,
-        settings.openai_model,
-        settings.openai_wire_api,
-    )
+    key = hashlib.sha256(
+        "\x1f".join(
+            (
+                settings.metabase_base_url,
+                settings.metabase_api_key,
+                settings.openai_api_key,
+                settings.openai_base_url,
+                settings.openai_model,
+                settings.openai_wire_api,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
     with _STATE_LOCK:
         graph = _GRAPH_CACHE.get(key)
         if graph is None:
