@@ -38,6 +38,7 @@ from metabase_agent.query.query_program_builder import (
 from metabase_agent.tools.metabase.client import MetabaseClient
 
 _AGGREGATIONS = ["count", "sum", "avg", "min", "max"]
+_client_cache: dict[tuple[str, str], MetabaseClient] = {}
 
 
 def tool_schemas() -> list[dict[str, Any]]:
@@ -114,7 +115,12 @@ class AgentTools:
 
     def client(self) -> MetabaseClient:
         if self._client is None:
-            self._client = MetabaseClient(self.settings.metabase_base_url, self.settings.metabase_api_key)
+            key = (self.settings.metabase_base_url, self.settings.metabase_api_key)
+            client = _client_cache.get(key)
+            if client is None:
+                client = MetabaseClient(self.settings.metabase_base_url, self.settings.metabase_api_key)
+                _client_cache[key] = client
+            self._client = client
         return self._client
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
