@@ -55,11 +55,12 @@ def run_tool_loop(
     approved_tool_call_id: str | None = None,
 ) -> LoopOutcome:
     schemas = tool_schemas()
+    last_result: dict[str, Any] | None = None
     if approved_sql is not None:
         messages = list(history)
-        result = tools.dispatch("run_sql", {"sql": approved_sql})
-        trace: list[dict[str, Any]] = [{"step": "tool.result", "tool": "run_sql", "status": result.get("status"), "approved": True}]
-        messages.append(_tool_result_message(approved_tool_call_id or "run_sql", "run_sql", result))
+        last_result = tools.dispatch("run_sql", {"sql": approved_sql})
+        trace: list[dict[str, Any]] = [{"step": "tool.result", "tool": "run_sql", "status": last_result.get("status"), "approved": True}]
+        messages.append(_tool_result_message(approved_tool_call_id or "run_sql", "run_sql", last_result))
     else:
         messages = _build_messages(question, history)
         trace = []
@@ -68,7 +69,7 @@ def run_tool_loop(
         reply = transport.complete(messages, schemas)
         if isinstance(reply, str):
             messages.append({"role": "assistant", "content": reply})
-            return LoopOutcome(status="completed", answer=reply, trace=trace, messages=messages)
+            return LoopOutcome(status="completed", answer=reply, trace=trace, messages=messages, last_result=last_result)
 
         messages.append({"role": "assistant", "content": "", "tool_calls": [_serialize_call(call) for call in reply]})
         for call in reply:
@@ -84,10 +85,11 @@ def run_tool_loop(
                     pending_tool_call_id=call.id,
                 )
             result = tools.dispatch(call.name, call.arguments)
+            last_result = result
             trace.append({"step": "tool.result", "tool": call.name, "status": result.get("status")})
             messages.append(_tool_result_message(call.id, call.name, result))
 
-    return LoopOutcome(status="exhausted", answer="未能在限定步数内完成查询，请缩小问题范围或补充条件。", trace=trace, messages=messages)
+    return LoopOutcome(status="exhausted", answer="未能在限定步数内完成查询，请缩小问题范围或补充条件。", trace=trace, messages=messages, last_result=last_result)
 
 
 def _serialize_call(call: ToolCall) -> dict[str, Any]:

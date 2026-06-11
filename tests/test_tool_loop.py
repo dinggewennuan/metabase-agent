@@ -192,3 +192,18 @@ def test_chat_adapter_parses_tool_calls(monkeypatch) -> None:
 
     assert isinstance(reply, list)
     assert reply[0].name == "list_databases"
+
+
+def test_loop_captures_last_tool_result_for_ui() -> None:
+    transport = _ScriptedTransport(
+        [
+            [ToolCall(id="c1", name="run_aggregation", arguments={"database_name": "BigQuery-GA", "schema_name": "business_data", "table_name": "orders", "aggregation": "count"})],
+            "orders 共 3 行。",
+        ]
+    )
+
+    outcome = run_tool_loop("orders 多少行", [], transport, _tools())
+
+    assert outcome.status == "completed"
+    assert outcome.last_result is not None
+    assert outcome.last_result["data"]["rows"] == [[3]]
