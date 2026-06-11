@@ -103,7 +103,7 @@ def is_bigquery_usage_report_request(question: str) -> bool:
     lowered = question.lower()
     has_bigquery = "bigquery" in lowered or "bigquery" in question
     has_sql_request = any(word in question for word in ("统计语句", "查询汇总语句", "查询语句", "统计")) or "sql" in lowered
-    has_month_range = "202511" in question or "26年4" in question or "2025-11" in question or "2026-04" in question
+    has_month_range = bool(re.search(r"\d{4}-\d{2}|\d{6}|\d{1,2}\s*月", question))
     has_usage_tables = any(table in question for table in ("fs_results", "aigc_imagecontents", "aigc_videocontents", "aigc_sessions", "aigc_audiocontents"))
     has_web_api = "web" in lowered and "api" in lowered
     return has_bigquery and has_sql_request and (has_month_range or has_usage_tables) and has_web_api
