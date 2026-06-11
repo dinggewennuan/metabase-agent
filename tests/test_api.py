@@ -466,3 +466,41 @@ def test_require_token_allows_with_correct_token(monkeypatch: pytest.MonkeyPatch
     response = client.post("/api/ask", json={"question": "当前有几个数据库？", "dry_run": True, "session_id": "rt2"}, headers={"X-Agent-Token": "secret"})
 
     assert response.status_code == 200
+
+
+def test_sqlite_store_shares_state_across_app_instances(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = str(tmp_path / "state.db")
+    monkeypatch.setenv("AGENT_STORE", "sqlite")
+    monkeypatch.setenv("AGENT_STATE_PATH", db)
+    get_settings.cache_clear()
+    import metabase_agent.api.app as app_module
+
+    app_module._SQLITE_STORE.clear()
+
+    worker_a = TestClient(create_app())
+    worker_b = TestClient(create_app())
+
+    worker_a.post("/api/ask", json={"question": "上周收入趋势怎么样？", "dry_run": True, "session_id": "shared"})
+    second = worker_b.post("/api/ask", json={"question": "我上次问的内容是什么？", "dry_run": True, "session_id": "shared"})
+
+    assert "上周收入趋势怎么样" in second.json()["answer"]
+
+
+def test_sqlite_session_ttl_evicts_stale_sessions(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    db = str(tmp_path / "state.db")
+    monkeypatch.setenv("AGENT_STORE", "sqlite")
+    monkeypatch.setenv("AGENT_STATE_PATH", db)
+    monkeypatch.setenv("AGENT_SESSION_TTL_SECONDS", "0.05")
+    get_settings.cache_clear()
+    import metabase_agent.api.app as app_module
+
+    app_module._SQLITE_STORE.clear()
+    client = TestClient(create_app())
+
+    client.post("/api/ask", json={"question": "上周收入趋势怎么样？", "dry_run": True, "session_id": "ttl"})
+    time.sleep(0.1)
+    second = client.post("/api/ask", json={"question": "我上次问的内容是什么？", "dry_run": True, "session_id": "ttl"})
+
+    assert second.json()["answer"] == "我还没有记住上一轮问题。"

@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     agent_require_token: bool = Field(default=False, alias="AGENT_REQUIRE_TOKEN")
     agent_memory_path: str = Field(default=".metabase_agent_memory.json", alias="AGENT_MEMORY_PATH")
     agent_state_path: str = Field(default=".metabase_agent_state.json", alias="AGENT_STATE_PATH")
+    agent_store: str = Field(default="memory", alias="AGENT_STORE")
+    agent_session_ttl_seconds: float = Field(default=0.0, alias="AGENT_SESSION_TTL_SECONDS")
     agent_api_token: str = Field(default="", alias="AGENT_API_TOKEN")
     metabase_bigquery_database_id: int = Field(default=19, alias="METABASE_BIGQUERY_DATABASE_ID")
     agent_report_range_start: str = Field(default="2025-11-01", alias="AGENT_REPORT_RANGE_START")

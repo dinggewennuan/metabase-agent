@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from metabase_agent.agent.graph import build_graph
 from metabase_agent.agent.tool_loop import LoopOutcome, iter_tool_loop
 from metabase_agent.agent.tools import AgentTools
+from metabase_agent.api.store import SqliteStore
 from metabase_agent.config.settings import Settings, get_settings
 from metabase_agent.query.bigquery_report_sql import extract_native_sql
 from metabase_agent.semantics.llm_client import build_tool_transport
@@ -27,6 +28,71 @@ MEMORY_LOADED = False
 STATE_LOADED = False
 _STATE_LOCK = threading.RLock()  # guards the in-memory dicts and on-disk writes
 _GRAPH_CACHE: dict[str, Any] = {}  # compiled graph reused across requests
+_SQLITE_STORE: dict[str, SqliteStore] = {}
+
+
+def _active_store() -> SqliteStore | None:
+    settings = get_settings()
+    if settings.agent_store != "sqlite":
+        return None
+    store = _SQLITE_STORE.get(settings.agent_state_path)
+    if store is None:
+        store = SqliteStore(settings.agent_state_path)
+        _SQLITE_STORE[settings.agent_state_path] = store
+    store.purge_expired(settings.agent_session_ttl_seconds)
+    return store
+
+
+def _get_approval(session_id: str) -> dict[str, Any] | None:
+    store = _active_store()
+    if store is not None:
+        return store.get_approval(session_id)
+    _load_state()
+    return PENDING_SQL_APPROVALS.get(session_id)
+
+
+def _set_approval(session_id: str, data: dict[str, Any]) -> None:
+    store = _active_store()
+    if store is not None:
+        store.set_approval(session_id, data)
+        return
+    PENDING_SQL_APPROVALS[session_id] = data
+    _save_state()
+
+
+def _pop_approval(session_id: str) -> None:
+    store = _active_store()
+    if store is not None:
+        store.pop_approval(session_id)
+        return
+    PENDING_SQL_APPROVALS.pop(session_id, None)
+    _save_state()
+
+
+def _get_table_context(session_id: str) -> dict[str, Any] | None:
+    store = _active_store()
+    if store is not None:
+        return store.get_table_context(session_id)
+    _load_state()
+    return PENDING_TABLE_CONTEXT.get(session_id)
+
+
+def _set_table_context(session_id: str, data: dict[str, Any]) -> None:
+    store = _active_store()
+    if store is not None:
+        store.set_table_context(session_id, data)
+        return
+    PENDING_TABLE_CONTEXT[session_id] = data
+    _save_state()
+
+
+def _pop_table_context(session_id: str) -> None:
+    store = _active_store()
+    if store is not None:
+        store.pop_table_context(session_id)
+        return
+    PENDING_TABLE_CONTEXT.pop(session_id, None)
+    _save_state()
 
 
 class AskRequest(BaseModel):
@@ -136,6 +202,9 @@ def _is_memory_message(value: object) -> bool:
 
 
 def _remember(session_id: str, role: str, content: str) -> list[dict[str, str]]:
+    store = _active_store()
+    if store is not None:
+        return store.append_message(session_id, role, content, MAX_MEMORY_MESSAGES)
     _load_memory()
     with _STATE_LOCK:
         history = CONVERSATION_MEMORY.setdefault(session_id, [])
@@ -147,6 +216,9 @@ def _remember(session_id: str, role: str, content: str) -> list[dict[str, str]]:
 
 
 def _history(session_id: str) -> list[dict[str, str]]:
+    store = _active_store()
+    if store is not None:
+        return store.history(session_id)
     _load_memory()
     return list(CONVERSATION_MEMORY.get(session_id, []))
 
@@ -223,18 +295,15 @@ class _PreparedAsk:
 def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk | None]:
     settings = get_settings()
     dry_run = settings.agent_dry_run if payload.dry_run is None else payload.dry_run
-    _load_memory()
-    _load_state()
-    history = CONVERSATION_MEMORY.setdefault(payload.session_id, [])
-    pending_sql = PENDING_SQL_APPROVALS.get(payload.session_id)
+    history = _history(payload.session_id)
+    pending_sql = _get_approval(payload.session_id)
     question = payload.question
     sql_approved = False
     if pending_sql and _is_sql_approval(question, payload.decision):
         question = str(pending_sql["question"])
         sql_approved = True
     elif pending_sql and _is_sql_rejection(question, payload.decision):
-        PENDING_SQL_APPROVALS.pop(payload.session_id, None)
-        _save_state()
+        _pop_approval(payload.session_id)
         answer = "已拒绝执行，SQL 未运行。"
         _remember(payload.session_id, "user", "拒绝执行")
         memory = _remember(payload.session_id, "assistant", answer)
@@ -248,7 +317,7 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
             memory=memory,
         ), None
     else:
-        question = _fill_table_follow_up(question, PENDING_TABLE_CONTEXT.get(payload.session_id))
+        question = _fill_table_follow_up(question, _get_table_context(payload.session_id))
     memory_answer = None if _use_tools(settings, dry_run) else _answer_from_memory(payload.question, history)
     if memory_answer is not None:
         _remember(payload.session_id, "user", payload.question)
@@ -283,9 +352,9 @@ def _finalize_ask(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any]
     answer = str(result.get("answer", ""))
     query_result = result.get("query_result")
     if isinstance(query_result, dict) and query_result.get("status") == "requires_approval":
-        PENDING_SQL_APPROVALS[payload.session_id] = {"question": run.question, "sql": query_result.get("sql")}
+        _set_approval(payload.session_id, {"question": run.question, "sql": query_result.get("sql")})
     elif run.sql_approved:
-        PENDING_SQL_APPROVALS.pop(payload.session_id, None)
+        _pop_approval(payload.session_id)
     if isinstance(query_result, dict):
         query_plan = result.get("query_plan")
         suggestions = query_result.get("suggestions")
@@ -300,10 +369,9 @@ def _finalize_ask(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any]
             selected_table = query_plan["table_name"]
             selected_schema = query_plan.get("schema_name")
         if selected_table:
-            PENDING_TABLE_CONTEXT[payload.session_id] = {"schema_name": selected_schema, "table_name": selected_table}
+            _set_table_context(payload.session_id, {"schema_name": selected_schema, "table_name": selected_table})
         elif not suggestions and query_result.get("status") == "completed":
-            PENDING_TABLE_CONTEXT.pop(payload.session_id, None)
-    _save_state()
+            _pop_table_context(payload.session_id)
     _remember(payload.session_id, "user", payload.question)
     memory = _remember(payload.session_id, "assistant", answer)
     return AskResponse(
@@ -340,7 +408,7 @@ _TOOL_STEP_LABELS = {"tool.call": "调用工具", "tool.result": "工具返回",
 
 
 def _tool_iterator(payload: AskRequest, run: _PreparedAsk, tools: AgentTools, transport: Any) -> Any:
-    pending = PENDING_SQL_APPROVALS.get(payload.session_id)
+    pending = _get_approval(payload.session_id)
     if run.sql_approved and isinstance(pending, dict) and pending.get("mode") == "tools":
         return iter_tool_loop(
             "",
@@ -355,12 +423,11 @@ def _tool_iterator(payload: AskRequest, run: _PreparedAsk, tools: AgentTools, tr
 
 def _finalize_tool_outcome(payload: AskRequest, run: _PreparedAsk, outcome: LoopOutcome) -> AskResponse:
     if outcome.status == "requires_approval":
-        PENDING_SQL_APPROVALS[payload.session_id] = {"question": run.question, "sql": outcome.pending_sql, "messages": outcome.messages, "tool_call_id": outcome.pending_tool_call_id, "mode": "tools"}
+        _set_approval(payload.session_id, {"question": run.question, "sql": outcome.pending_sql, "messages": outcome.messages, "tool_call_id": outcome.pending_tool_call_id, "mode": "tools"})
         query_result: dict[str, Any] = {"status": "requires_approval", "sql": outcome.pending_sql}
     else:
-        PENDING_SQL_APPROVALS.pop(payload.session_id, None)
+        _pop_approval(payload.session_id)
         query_result = outcome.last_result or {"status": outcome.status}
-    _save_state()
     _remember(payload.session_id, "user", payload.question)
     memory = _remember(payload.session_id, "assistant", outcome.answer)
     return AskResponse(
