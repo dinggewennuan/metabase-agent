@@ -17,3 +17,10 @@ def test_openai_model_defaults_to_gpt_5() -> None:
     settings = Settings(OPENAI_MODEL="gpt-5")
 
     assert settings.openai_model == "gpt-5"
+
+
+def test_get_settings_is_cached() -> None:
+    from metabase_agent.config.settings import get_settings
+
+    get_settings.cache_clear()
+    assert get_settings() is get_settings()

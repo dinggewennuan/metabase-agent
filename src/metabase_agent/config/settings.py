@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -9,6 +11,7 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(default="https://api.openai.com/v1", alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-5", alias="OPENAI_MODEL")
     openai_wire_api: str = Field(default="chat_completions", alias="OPENAI_WIRE_API")
+    openai_timeout: float = Field(default=120.0, alias="OPENAI_TIMEOUT")
     metabase_base_url: str = Field(default="https://akool.metabaseapp.com", alias="METABASE_BASE_URL")
     metabase_api_key: str = Field(default="", alias="METABASE_API_KEY")
     agent_dry_run: bool = Field(default=True, alias="AGENT_DRY_RUN")
@@ -21,5 +24,6 @@ class Settings(BaseSettings):
     agent_report_timezone: str = Field(default="US/Pacific", alias="AGENT_REPORT_TIMEZONE")
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()

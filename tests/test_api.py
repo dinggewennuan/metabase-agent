@@ -13,10 +13,12 @@ from metabase_agent.api.app import (
     _remember,
     create_app,
 )
+from metabase_agent.config.settings import get_settings
 
 
 @pytest.fixture(autouse=True)
 def isolated_memory(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    get_settings.cache_clear()
     monkeypatch.setenv("AGENT_MEMORY_PATH", str(tmp_path / "memory.json"))
     monkeypatch.setenv("AGENT_STATE_PATH", str(tmp_path / "state.json"))
     monkeypatch.delenv("AGENT_API_TOKEN", raising=False)
@@ -26,6 +28,8 @@ def isolated_memory(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     PENDING_SQL_APPROVALS.clear()
     PENDING_TABLE_CONTEXT.clear()
     _GRAPH_CACHE.clear()
+    yield
+    get_settings.cache_clear()
 
 
 def test_pending_approval_survives_app_restart(monkeypatch: pytest.MonkeyPatch) -> None:
