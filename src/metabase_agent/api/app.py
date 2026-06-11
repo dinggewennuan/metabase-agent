@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from metabase_agent.agent.graph import build_graph
-from metabase_agent.agent.tool_loop import run_tool_loop
+from metabase_agent.agent.tool_loop import LoopOutcome, iter_tool_loop
 from metabase_agent.agent.tools import AgentTools
 from metabase_agent.config.settings import Settings, get_settings
 from metabase_agent.query.bigquery_report_sql import extract_native_sql
@@ -336,24 +336,24 @@ def _run_ask(payload: AskRequest) -> AskResponse:
     return _finalize_ask(payload, run, result)
 
 
-def _run_ask_tools(payload: AskRequest, run: _PreparedAsk, settings: Settings) -> AskResponse:
-    tools = AgentTools(settings, dry_run=run.dry_run)
-    transport = build_tool_transport(settings)
+_TOOL_STEP_LABELS = {"tool.call": "调用工具", "tool.result": "工具返回", "tool.repeated": "跳过重复调用"}
+
+
+def _tool_iterator(payload: AskRequest, run: _PreparedAsk, tools: AgentTools, transport: Any) -> Any:
     pending = PENDING_SQL_APPROVALS.get(payload.session_id)
-    try:
-        if run.sql_approved and isinstance(pending, dict) and pending.get("mode") == "tools":
-            outcome = run_tool_loop(
-                "",
-                cast(list[dict[str, Any]], pending.get("messages") or []),
-                transport,
-                tools,
-                approved_sql=str(pending.get("sql") or ""),
-                approved_tool_call_id=str(pending.get("tool_call_id") or ""),
-            )
-        else:
-            outcome = run_tool_loop(run.question, _history(payload.session_id), transport, tools)
-    except Exception as exc:
-        return _failed_ask(payload, exc)
+    if run.sql_approved and isinstance(pending, dict) and pending.get("mode") == "tools":
+        return iter_tool_loop(
+            "",
+            cast(list[dict[str, Any]], pending.get("messages") or []),
+            transport,
+            tools,
+            approved_sql=str(pending.get("sql") or ""),
+            approved_tool_call_id=str(pending.get("tool_call_id") or ""),
+        )
+    return iter_tool_loop(run.question, _history(payload.session_id), transport, tools)
+
+
+def _finalize_tool_outcome(payload: AskRequest, run: _PreparedAsk, outcome: LoopOutcome) -> AskResponse:
     if outcome.status == "requires_approval":
         PENDING_SQL_APPROVALS[payload.session_id] = {"question": run.question, "sql": outcome.pending_sql, "messages": outcome.messages, "tool_call_id": outcome.pending_tool_call_id, "mode": "tools"}
         query_result: dict[str, Any] = {"status": "requires_approval", "sql": outcome.pending_sql}
@@ -372,6 +372,35 @@ def _run_ask_tools(payload: AskRequest, run: _PreparedAsk, settings: Settings) -
         session_id=payload.session_id,
         memory=memory,
     )
+
+
+def _run_ask_tools(payload: AskRequest, run: _PreparedAsk, settings: Settings) -> AskResponse:
+    tools = AgentTools(settings, dry_run=run.dry_run)
+    transport = build_tool_transport(settings)
+    try:
+        outcome = LoopOutcome(status="exhausted")
+        for kind, item in _tool_iterator(payload, run, tools, transport):
+            if kind == "outcome":
+                outcome = item
+    except Exception as exc:
+        return _failed_ask(payload, exc)
+    return _finalize_tool_outcome(payload, run, outcome)
+
+
+def _stream_ask_tools(payload: AskRequest, run: _PreparedAsk, settings: Settings) -> Any:
+    tools = AgentTools(settings, dry_run=run.dry_run)
+    transport = build_tool_transport(settings)
+    outcome = LoopOutcome(status="exhausted")
+    try:
+        for kind, item in _tool_iterator(payload, run, tools, transport):
+            if kind == "trace":
+                yield _stream_event("status", {"message": _TOOL_STEP_LABELS.get(item.get("step"), "工具进行中"), "tool": item.get("tool"), "node": "tool_loop"})
+            elif kind == "outcome":
+                outcome = item
+        data = _finalize_tool_outcome(payload, run, outcome).model_dump()
+    except Exception as exc:
+        data = _failed_ask(payload, exc).model_dump()
+    yield _stream_event("final", data)
 
 
 def _get_graph(settings: Settings) -> Any:
@@ -467,7 +496,7 @@ def create_app() -> FastAPI:
             settings = get_settings()
             if _use_tools(settings, run.dry_run):
                 yield _stream_event("status", {"message": "Agent 正在调用工具...", "node": "tool_loop"})
-                yield _stream_event("final", _run_ask_tools(payload, run, settings).model_dump())
+                yield from _stream_ask_tools(payload, run, settings)
                 return
             graph = _get_graph(settings)
             result: dict[str, Any] = {}
