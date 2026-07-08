@@ -110,6 +110,9 @@ class MetabaseClient:
             json={"database": database_id, "type": "native", "native": {"query": sql}, "parameters": []},
         )
 
+    def execute_mbql_query(self, payload: dict[str, Any]) -> Any:
+        return self.request("POST", "/api/dataset", json=payload)
+
 
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
     retry_after = response.headers.get("Retry-After")

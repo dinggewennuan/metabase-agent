@@ -170,10 +170,17 @@ def extract_table_name(question: str) -> str | None:
     match = re.search(r"([A-Za-z0-9_\-]+)\s+(?:table|collection)\b", question, re.IGNORECASE)
     if match:
         return match.group(1)
-    schema_table_match = re.search(r"[A-Za-z0-9_\-]+\s*下\s*([A-Za-z0-9_\-]+)", question)
+    schema_table_match = re.search(
+        r"[A-Za-z0-9_\-]+\s*下\s*([A-Za-z0-9_\-\s]+?)(?=\s*(?:最近|近|过去|昨天|上周|每天|按天|每周|按周|每月|按月|count|多少|条数|行数|记录数|求和|总和|合计|平均|最大|最小|字段|列|表|,|，|。|$))",
+        question,
+    )
     if schema_table_match and extract_aggregation_function(question):
-        return schema_table_match.group(1)
+        return _normalize_extracted_table_name(schema_table_match.group(1))
     return None
+
+
+def _normalize_extracted_table_name(value: str) -> str:
+    return re.sub(r"\s+", "_", value.strip())
 
 
 def extract_aggregation_function(question: str) -> str | None:

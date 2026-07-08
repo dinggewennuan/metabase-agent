@@ -77,6 +77,17 @@ def test_parse_schema_table_recent_daily_count() -> None:
     assert parsed["time_grain"] == "day"
 
 
+def test_parse_schema_table_recent_daily_count_with_spaced_identifier() -> None:
+    parsed = parse_intent("business_data 下 fs results最近7天的每天的数据count ,并分析一下最近2天数量是否增长，以及哪部分有了增长啊")
+
+    assert parsed["intent"] == "table_aggregation"
+    assert parsed["schema_name"] == "business_data"
+    assert parsed["table_name"] == "fs_results"
+    assert parsed["aggregation_function"] == "count"
+    assert parsed["relative_days"] == 7
+    assert parsed["time_grain"] == "day"
+
+
 def test_parse_table_name_with_table_suffix_word_inside_identifier() -> None:
     parsed = parse_intent("business_data 下missing_table 最近7天的每天的数据count")
 

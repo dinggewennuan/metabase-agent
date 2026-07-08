@@ -32,8 +32,8 @@ from metabase_agent.query.bigquery_report_sql import (
     is_read_only_sql,
 )
 from metabase_agent.query.query_program_builder import (
-    _table_aggregation_v1_payload,
     build_table_aggregation_program,
+    table_aggregation_dataset_payload,
 )
 from metabase_agent.tools.metabase.client import MetabaseClient
 
@@ -199,7 +199,7 @@ class AgentTools:
         aggregation = str(arguments.get("aggregation") or "count")
         if aggregation not in _AGGREGATIONS:
             return {"status": "error", "error": f"aggregation must be one of {_AGGREGATIONS}"}
-        _database, tables = self._resolve_tables(str(arguments.get("database_name") or ""), arguments.get("schema_name"))
+        database, tables = self._resolve_tables(str(arguments.get("database_name") or ""), arguments.get("schema_name"))
         table = _find_table(tables, str(arguments.get("table_name") or ""))
         if table is None:
             return {"status": "not_found", "error": f"table not found: {arguments.get('table_name')}"}
@@ -224,17 +224,17 @@ class AgentTools:
             return {"status": "blocked", "error": policy["reason"]}
         if self.dry_run:
             return {"status": "completed", "row_count": 1, "data": {"cols": [{"display_name": aggregation}], "rows": [[3]]}}
-        return self._execute_aggregation(program)
+        database_id = int(database["id"]) if database and database.get("id") is not None else self.bigquery_database_id
+        return self._execute_aggregation(database_id, program)
 
-    def _execute_aggregation(self, program: dict[str, Any]) -> dict[str, Any]:
+    def _execute_aggregation(self, database_id: int, program: dict[str, Any]) -> dict[str, Any]:
         query_program = {"source": program["source"], "operations": program["operations"]}
         try:
             return self.client().query(query_program)
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code != 404:
+            if exc.response.status_code not in {400, 404}:
                 raise
-            constructed = self.client().construct_query_v1(_table_aggregation_v1_payload(program))
-            return self.client().execute_query_v1(constructed)
+            return self.client().execute_mbql_query(table_aggregation_dataset_payload(database_id, program))
 
     def _resolve_database_id(self, database_name: str | None) -> int:
         if not database_name:

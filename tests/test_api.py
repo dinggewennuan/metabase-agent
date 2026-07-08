@@ -6,7 +6,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from metabase_agent.api.app import (
+    _CHECKPOINTER_CACHE,
     _GRAPH_CACHE,
+    _MEMORY_MANAGER_CACHE,
+    _SKILL_REGISTRY_CACHE,
     CONVERSATION_MEMORY,
     PENDING_SQL_APPROVALS,
     PENDING_TABLE_CONTEXT,
@@ -27,7 +30,10 @@ def isolated_memory(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     CONVERSATION_MEMORY.clear()
     PENDING_SQL_APPROVALS.clear()
     PENDING_TABLE_CONTEXT.clear()
+    _CHECKPOINTER_CACHE.clear()
     _GRAPH_CACHE.clear()
+    _MEMORY_MANAGER_CACHE.clear()
+    _SKILL_REGISTRY_CACHE.clear()
     yield
     get_settings.cache_clear()
 
@@ -143,6 +149,34 @@ def test_graph_is_built_once_and_reused_across_requests(monkeypatch: pytest.Monk
     assert count["n"] == 1
 
 
+def test_mongodb_checkpointing_passes_session_id_as_thread_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeGraph:
+        def invoke(self, payload: dict[str, object], config: dict[str, object] | None = None) -> dict[str, object]:
+            seen["payload"] = payload
+            seen["config"] = config
+            return {
+                "answer": "ok",
+                "query_plan": {"intent": "test"},
+                "program": None,
+                "query_result": {"status": "completed"},
+                "trace": [],
+            }
+
+    monkeypatch.setenv("AGENT_CHECKPOINT_BACKEND", "mongodb")
+    monkeypatch.setenv("AGENT_MONGODB_URI", "mongodb://127.0.0.1:27017")
+    get_settings.cache_clear()
+    monkeypatch.setattr("metabase_agent.api.app._checkpointer", lambda settings: object())
+    monkeypatch.setattr("metabase_agent.api.app.build_graph", lambda settings, checkpointer=None: FakeGraph())
+    client = TestClient(create_app())
+
+    response = client.post("/api/ask", json={"question": "x", "dry_run": True, "session_id": "thread-1"})
+
+    assert response.status_code == 200
+    assert seen["config"] == {"configurable": {"thread_id": "thread-1"}}
+
+
 def test_home_page_loads() -> None:
     client = TestClient(create_app())
 
@@ -199,6 +233,68 @@ def test_session_api_returns_memory_for_continuous_chat() -> None:
     assert data["session_id"] == "session-history"
     assert data["memory"][0] == {"role": "user", "content": "上周收入趋势怎么样？"}
     assert data["memory"][1]["role"] == "assistant"
+
+
+def test_session_api_returns_pending_approval_for_reload() -> None:
+    client = TestClient(create_app())
+
+    client.post("/api/ask", json={"question": "请执行 SELECT 1 AS ok", "dry_run": True, "session_id": "pending-reload"})
+    response = client.get("/api/sessions/pending-reload")
+
+    assert response.status_code == 200
+    assert response.json()["pending_approval"] == {"status": "requires_approval", "sql": "SELECT 1 AS ok"}
+
+
+def test_memory_admin_api_writes_lists_and_activates_procedural_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    from metabase_agent.memory.manager import MemoryManager
+    from metabase_agent.memory.repository import InMemoryMemoryRepository
+    from metabase_agent.memory.vector import HashEmbeddingProvider, InMemoryVectorIndex
+
+    manager = MemoryManager(InMemoryMemoryRepository(), InMemoryVectorIndex(), HashEmbeddingProvider())
+    monkeypatch.setenv("AGENT_LONG_TERM_MEMORY_ENABLED", "true")
+    get_settings.cache_clear()
+    monkeypatch.setattr("metabase_agent.api.app._memory_manager", lambda settings: manager)
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/api/memories",
+        json={
+            "tenant_id": "t1",
+            "user_id": "u1",
+            "memory_type": "procedural",
+            "key": "rule.sql.require_review",
+            "content": "执行 SQL 前必须先让用户确认。",
+            "status": "pending_review",
+        },
+    )
+
+    assert created.status_code == 200
+    record = created.json()["memory"]
+    assert record["status"] == "pending_review"
+
+    pending = client.get(
+        "/api/memories",
+        params={"tenant_id": "t1", "user_id": "u1", "memory_type": "procedural", "status": "pending_review"},
+    )
+    assert pending.status_code == 200
+    assert pending.json()["memories"][0]["key"] == "rule.sql.require_review"
+
+    activated = client.post(
+        f"/api/memories/{record['id']}/status",
+        json={"tenant_id": "t1", "user_id": "u1", "status": "active"},
+    )
+    assert activated.status_code == 200
+    assert activated.json()["memory"]["status"] == "active"
+    assert "执行 SQL 前必须先让用户确认" in manager.load_context(tenant_id="t1", user_id="u1", query="SQL 可以执行吗").rendered
+
+
+def test_memory_admin_api_requires_long_term_memory_enabled() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/api/memories", params={"tenant_id": "t1", "user_id": "u1"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "AGENT_LONG_TERM_MEMORY_ENABLED is false"
 
 
 def test_session_memory_survives_app_recreate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -350,6 +446,25 @@ def test_ask_api_uses_previous_successful_table_for_follow_up() -> None:
     data = second.json()
     assert data["query_plan"]["table_name"] == "orders"
     assert data["query_plan"]["schema_name"] == "business_data"
+    assert data["query_result"]["status"] == "requires_approval"
+
+
+def test_ask_api_uses_previous_table_and_metric_for_growth_follow_up() -> None:
+    client = TestClient(create_app())
+
+    first = client.post("/api/ask", json={"question": "business_data 下orders 最近7天的每天的数据count", "dry_run": True, "session_id": "growth-follow-up"})
+    first_approved = client.post("/api/ask", json={"question": "确认执行", "dry_run": True, "session_id": "growth-follow-up"})
+    second = client.post("/api/ask", json={"question": "分析一下最近2天数量是否增长，以及哪部分有了增长", "dry_run": True, "session_id": "growth-follow-up"})
+
+    assert first.status_code == 200
+    assert first_approved.status_code == 200
+    assert second.status_code == 200
+    data = second.json()
+    assert data["query_plan"]["table_name"] == "orders"
+    assert data["query_plan"]["schema_name"] == "business_data"
+    assert data["query_plan"]["aggregation_function"] == "count"
+    assert data["query_plan"]["relative_days"] == 2
+    assert data["query_plan"]["time_grain"] == "day"
     assert data["query_result"]["status"] == "requires_approval"
 
 

@@ -1,3 +1,5 @@
+import httpx
+
 from metabase_agent.agent.graph import build_graph
 from metabase_agent.agent.metadata import _find_table, _infer_database_name
 from metabase_agent.config.settings import Settings
@@ -187,6 +189,12 @@ def test_find_table_matches_singular_business_alias() -> None:
     assert _find_table(tables, "orders") == {"name": "bll_billing_order"}
 
 
+def test_find_table_prefers_normalized_exact_name_over_partial_token_match() -> None:
+    tables = [{"name": "fs_audioresultrecords"}, {"name": "fs_results"}, {"name": "open_results"}]
+
+    assert _find_table(tables, "fs results") == {"name": "fs_results"}
+
+
 def test_graph_dry_run_recent_daily_table_count() -> None:
     graph = build_graph(Settings(AGENT_DRY_RUN=True))
 
@@ -205,6 +213,94 @@ def test_graph_dry_run_recent_daily_table_count() -> None:
     assert result["query_plan"]["date_field_name"] == "created_at"
     assert result["query_plan"]["relative_days"] == 7
     assert result["query_plan"]["time_grain"] == "day"
+
+
+def test_graph_table_aggregation_falls_back_when_agent_table_endpoint_missing(monkeypatch) -> None:
+    request = httpx.Request("GET", "https://example.test/api/agent/v1/table/1332")
+    response = httpx.Response(404, request=request)
+
+    monkeypatch.setattr("metabase_agent.agent.graph.parse_intent_with_llm", lambda question, settings: None)
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.MetabaseClient.list_databases",
+        lambda self: {"data": [{"id": 19, "name": "BigQuery-GA", "engine": "bigquery"}]},
+    )
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.MetabaseClient.get_database_schema",
+        lambda self, database_id, schema_name: [{"id": 1332, "name": "orders", "schema": "business_data"}],
+    )
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.MetabaseClient.get_table_query_metadata",
+        lambda self, table_id: {"fields": [{"id": 305, "name": "created_at", "display_name": "created_at", "base_type": "type/DateTime"}]},
+    )
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.MetabaseClient.get_table",
+        lambda self, table_id: (_ for _ in ()).throw(httpx.HTTPStatusError("not found", request=request, response=response)),
+    )
+    graph = build_graph(Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="test-key", METABASE_BASE_URL="https://example.test"))
+
+    result = graph.invoke({"question": "business_data 下orders 最近7天的每天的数据count", "dry_run": False})
+
+    assert result["query_result"]["status"] == "requires_approval"
+    assert result["program"]["source"] == {"type": "table", "id": 1332}
+    assert "agent_field_ids" not in result["program"]
+    assert {
+        "step": "metabase.response",
+        "endpoint": "GET /api/agent/v1/table/1332",
+        "status": "not_found",
+        "fallback": "GET /api/table/{table_id}/query_metadata",
+    } in result["trace"]
+
+
+def test_graph_table_aggregation_falls_back_to_dataset_when_agent_query_rejects(monkeypatch) -> None:
+    request = httpx.Request("POST", "https://example.test/api/agent/v2/query")
+    response = httpx.Response(400, request=request)
+    dataset_payloads: list[dict] = []
+
+    monkeypatch.setattr("metabase_agent.agent.graph.parse_intent_with_llm", lambda question, settings: None)
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.MetabaseClient.list_databases",
+        lambda self: {"data": [{"id": 19, "name": "BigQuery-GA", "engine": "bigquery"}]},
+    )
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.MetabaseClient.get_database_schema",
+        lambda self, database_id, schema_name: [{"id": 1332, "name": "orders", "schema": "business_data"}],
+    )
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.MetabaseClient.get_table_query_metadata",
+        lambda self, table_id: {"fields": [{"id": 305, "name": "created_at", "display_name": "created_at", "base_type": "type/DateTime"}]},
+    )
+    monkeypatch.setattr("metabase_agent.agent.graph.MetabaseClient.get_table", lambda self, table_id: {"fields": []})
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.MetabaseClient.query",
+        lambda self, program: (_ for _ in ()).throw(httpx.HTTPStatusError("bad request", request=request, response=response)),
+    )
+
+    def execute_mbql_query(self, payload: dict) -> dict[str, object]:
+        dataset_payloads.append(payload)
+        return {"status": "completed", "row_count": 2, "data": {"cols": [], "rows": [["2026-06-30", 1], ["2026-07-01", 2]]}}
+
+    monkeypatch.setattr("metabase_agent.agent.graph.MetabaseClient.execute_mbql_query", execute_mbql_query)
+    graph = build_graph(Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="test-key", METABASE_BASE_URL="https://example.test"))
+
+    result = graph.invoke({"question": "business_data 下orders 最近7天的每天的数据count", "dry_run": False, "sql_approved": True})
+
+    assert result["query_result"]["status"] == "completed"
+    assert dataset_payloads == [
+        {
+            "database": 19,
+            "type": "query",
+            "query": {
+                "source-table": 1332,
+                "filter": ["time-interval", ["field", 305, None], -7, "day"],
+                "aggregation": [["count"]],
+                "breakout": [["field", 305, {"temporal-unit": "day"}]],
+                "order-by": [["asc", ["field", 305, {"temporal-unit": "day"}]]],
+                "limit": 200,
+            },
+            "parameters": [],
+        }
+    ]
+    assert any(item.get("endpoint") == "POST /api/dataset" for item in result["trace"])
 
 
 def test_graph_executes_recent_daily_table_count_after_approval() -> None:
@@ -226,6 +322,18 @@ def test_graph_executes_recent_daily_table_count_after_approval() -> None:
     assert result["query_plan"]["relative_days"] == 7
     assert result["query_plan"]["time_grain"] == "day"
     assert result["query_result"]["row_count"] == 2
+
+
+def test_graph_analyzes_recent_two_day_growth_after_approved_table_count() -> None:
+    graph = build_graph(Settings(AGENT_DRY_RUN=True))
+
+    result = graph.invoke({"question": "business_data 下orders 最近7天的每天的数据count，并分析一下最近2天数量是否增长，以及哪部分有了增长啊", "dry_run": True, "sql_approved": True})
+
+    assert "最近两天总量增长" in result["answer"]
+    assert "2026-05-11 为 3" in result["answer"]
+    assert "2026-05-12 为 5" in result["answer"]
+    assert "变化 +2" in result["answer"]
+    assert "未指定拆分维度" in result["answer"]
 
 
 def test_infer_database_name_prefers_bigquery_for_schema_queries() -> None:

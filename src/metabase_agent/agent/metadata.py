@@ -42,20 +42,30 @@ def _table_items(payload: Any) -> list[dict[str, Any]]:
 
 def _find_table(tables: list[dict[str, Any]], table_name: str) -> dict[str, Any] | None:
     expected = table_name.lower()
+    normalized_expected = _normalize_table_name(table_name)
     for table in tables:
         name = str(table.get("name", "")).lower()
         display_name = str(table.get("display_name", "")).lower()
         if name == expected or display_name == expected:
             return table
     for table in tables:
-        name = str(table.get("name", "")).lower()
-        display_name = str(table.get("display_name", "")).lower()
-        if expected in name or expected in display_name:
+        name = str(table.get("name") or "")
+        display_name = str(table.get("display_name") or "")
+        if _normalize_table_name(name) == normalized_expected or _normalize_table_name(display_name) == normalized_expected:
             return table
     candidates = _rank_table_candidates(tables, table_name)
     if len(candidates) == 1 or (candidates and len(candidates) > 1 and candidates[0][1] > candidates[1][1]):
         return candidates[0][0]
+    for table in tables:
+        name = str(table.get("name", "")).lower()
+        display_name = str(table.get("display_name", "")).lower()
+        if len(expected) >= 4 and (expected in name or expected in display_name):
+            return table
     return None
+
+
+def _normalize_table_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
 def _rank_table_candidates(tables: list[dict[str, Any]], table_name: str) -> list[tuple[dict[str, Any], int]]:

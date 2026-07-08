@@ -118,3 +118,27 @@ def test_metabase_client_executes_native_query_payload(monkeypatch) -> None:
     assert result == {"status": "completed"}
     assert FakeHttpxClient.requests[0].url == "https://example.test/api/dataset"
     assert bodies == [{"database": 19, "type": "native", "native": {"query": "SELECT 1"}, "parameters": []}]
+
+
+def test_metabase_client_executes_mbql_query_payload(monkeypatch) -> None:
+    FakeHttpxClient.responses = [httpx.Response(200, json={"status": "completed"})]
+    FakeHttpxClient.requests = []
+    bodies: list[object] = []
+
+    def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        bodies.append(kwargs.get("json"))
+        request = httpx.Request(method, url)
+        self.requests.append(request)
+        response = self.responses.pop(0)
+        response.request = request
+        return response
+
+    monkeypatch.setattr(FakeHttpxClient, "request", request)
+    monkeypatch.setattr("metabase_agent.tools.metabase.client.httpx.Client", FakeHttpxClient)
+    payload = {"database": 19, "type": "query", "query": {"source-table": 11}, "parameters": []}
+
+    result = MetabaseClient("https://example.test", "key").execute_mbql_query(payload)
+
+    assert result == {"status": "completed"}
+    assert FakeHttpxClient.requests[0].url == "https://example.test/api/dataset"
+    assert bodies == [payload]

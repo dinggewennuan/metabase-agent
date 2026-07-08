@@ -6,6 +6,7 @@ from metabase_agent.query.query_program_builder import (
     _table_aggregation_v1_payload,
     build_program,
     build_table_aggregation_program,
+    table_aggregation_dataset_payload,
 )
 
 
@@ -77,4 +78,37 @@ def test_table_recent_daily_count_v1_payload_translates_program() -> None:
             {"field_id": "t11-2", "operation": "less-than", "value": (date.today() + timedelta(days=1)).isoformat()},
         ],
         "group_by": [{"field_id": "t11-2", "field_granularity": "day"}],
+    }
+
+
+def test_table_recent_daily_count_dataset_payload_translates_program() -> None:
+    program = build_table_aggregation_program(11, "count", date_field_id=2, relative_days=7, time_grain="day")
+
+    assert table_aggregation_dataset_payload(19, program) == {
+        "database": 19,
+        "type": "query",
+        "query": {
+            "source-table": 11,
+            "filter": ["time-interval", ["field", 2, None], -7, "day"],
+            "aggregation": [["count"]],
+            "breakout": [["field", 2, {"temporal-unit": "day"}]],
+            "order-by": [["asc", ["field", 2, {"temporal-unit": "day"}]]],
+            "limit": 200,
+        },
+        "parameters": [],
+    }
+
+
+def test_table_sum_dataset_payload_translates_program() -> None:
+    program = build_table_aggregation_program(11, "sum", 3)
+
+    assert table_aggregation_dataset_payload(19, program) == {
+        "database": 19,
+        "type": "query",
+        "query": {
+            "source-table": 11,
+            "aggregation": [["sum", ["field", 3, None]]],
+            "limit": 200,
+        },
+        "parameters": [],
     }

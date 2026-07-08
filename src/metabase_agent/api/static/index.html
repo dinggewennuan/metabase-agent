@@ -47,8 +47,8 @@
     .bubble-copy, .bubble-toggle { border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.62); color: var(--muted); padding: 4px 8px; font-size: 11px; font-weight: 800; line-height: 1.2; }
     .bubble-copy:hover, .bubble-toggle:hover { color: var(--ink); background: rgba(255,255,255,.9); }
     .bubble-toggle.hidden { display: none; }
-    .bubble-content.collapsible { max-height: 260px; overflow: hidden; }
-    .bubble-content.collapsed { max-height: 120px; }
+    .bubble-content.collapsible { position: relative; }
+    .bubble-content.collapsed { max-height: 120px; overflow: hidden; }
     .bubble-content.collapsed::after { content: ''; position: absolute; left: 16px; right: 16px; bottom: 14px; height: 54px; background: linear-gradient(rgba(255,255,255,0), rgba(255,255,255,.92)); pointer-events: none; border-radius: 0 0 18px 18px; }
     .approval-actions { display: flex; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
     .approval-actions button { border-radius: 12px; padding: 8px 11px; font-size: 12px; }
@@ -291,13 +291,25 @@
       toggle.textContent = collapsed ? '展开' : '折叠';
       toggle.setAttribute('aria-expanded', String(!collapsed));
     }
-    function renderMemory(memory) {
+    function renderMemory(memory, pendingApproval) {
       chat.innerHTML = '';
       if (!memory || !memory.length) {
-        addBubble('agent', '等待提问。你可以先用 dry-run 示例验证本地流程，再切换真实查询。');
+        const emptyTurn = addBubble('agent', '等待提问。你可以先用 dry-run 示例验证本地流程，再切换真实查询。');
+        if (pendingApproval) {
+          attachApprovalActions(emptyTurn, pendingApproval);
+        }
         return;
       }
-      memory.forEach(message => addBubble(message.role === 'user' ? 'user' : 'agent', message.content));
+      let lastAgentTurn = null;
+      memory.forEach(message => {
+        const turn = addBubble(message.role === 'user' ? 'user' : 'agent', message.content);
+        if (message.role !== 'user') {
+          lastAgentTurn = turn;
+        }
+      });
+      if (pendingApproval && lastAgentTurn) {
+        attachApprovalActions(lastAgentTurn, pendingApproval);
+      }
     }
     function renderSteps(trace) {
       steps.innerHTML = '';
@@ -386,7 +398,11 @@
       if (!result || result.status !== 'requires_approval' || !result.sql) {
         return;
       }
-      const content = bubbleContent(turn);
+      const bubble = turn.querySelector('.bubble');
+      if (!bubble) {
+        return;
+      }
+      bubble.querySelectorAll('.approval-actions').forEach(node => node.remove());
       const actions = document.createElement('div');
       actions.className = 'approval-actions';
       const approve = document.createElement('button');
@@ -399,7 +415,7 @@
       reject.textContent = '拒绝';
       reject.addEventListener('click', () => runApproval('reject', actions));
       actions.append(approve, reject);
-      content.appendChild(actions);
+      bubble.appendChild(actions);
     }
     function applyFinalData(data, turn) {
       renderSteps(data.trace);
@@ -413,7 +429,7 @@
         attachApprovalActions(turn, data.query_result);
         updateBubbleCollapse(turn);
       } else {
-        renderMemory(data.memory);
+        renderMemory(data.memory, null);
       }
       status.textContent = `完成：session ${data.session_id || ''}`;
     }
@@ -534,7 +550,7 @@
       localStorage.setItem(storageKey, sessionId);
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {headers: authHeaders({})});
       const data = await res.json();
-      renderMemory(data.memory);
+      renderMemory(data.memory, data.pending_approval);
       sessionPill.textContent = `session: ${sessionId}`;
       status.textContent = `已加载 session ${sessionId}`;
     }

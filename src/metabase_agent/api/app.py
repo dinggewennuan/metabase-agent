@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -17,10 +18,18 @@ from metabase_agent.agent.tool_loop import LoopOutcome, iter_tool_loop
 from metabase_agent.agent.tools import AgentTools
 from metabase_agent.api.store import SqliteStore
 from metabase_agent.config.settings import Settings, get_settings
+from metabase_agent.memory import (
+    MemoryManager,
+    MemoryStatus,
+    MemoryType,
+    build_memory_manager,
+)
 from metabase_agent.query.bigquery_report_sql import extract_native_sql
 from metabase_agent.semantics.llm_client import build_tool_transport
+from metabase_agent.skills import SkillRegistry, build_skill_registry
 
 MAX_MEMORY_MESSAGES = 20
+_LOGGER = logging.getLogger("metabase_agent")
 CONVERSATION_MEMORY: dict[str, list[dict[str, str]]] = {}
 PENDING_SQL_APPROVALS: dict[str, dict[str, Any]] = {}
 PENDING_TABLE_CONTEXT: dict[str, dict[str, Any]] = {}
@@ -29,6 +38,9 @@ STATE_LOADED = False
 _STATE_LOCK = threading.RLock()  # guards the in-memory dicts and on-disk writes
 _GRAPH_CACHE: dict[str, Any] = {}  # compiled graph reused across requests
 _SQLITE_STORE: dict[str, SqliteStore] = {}
+_MEMORY_MANAGER_CACHE: dict[tuple[Any, ...], MemoryManager] = {}
+_SKILL_REGISTRY_CACHE: dict[tuple[Any, ...], SkillRegistry] = {}
+_CHECKPOINTER_CACHE: dict[tuple[Any, ...], Any] = {}
 
 
 def _active_store() -> SqliteStore | None:
@@ -99,6 +111,8 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=1)
     dry_run: bool | None = None
     session_id: str = Field(default="default", min_length=1)
+    tenant_id: str | None = None
+    user_id: str | None = None
     decision: str | None = None  # "approve" / "reject" — explicit signal for a pending SQL review
 
 
@@ -119,6 +133,33 @@ class AskResponse(BaseModel):
 class SessionResponse(BaseModel):
     session_id: str
     memory: list[dict[str, str]]
+    pending_approval: dict[str, Any] | None = None
+
+
+class MemoryWriteRequest(BaseModel):
+    tenant_id: str | None = None
+    user_id: str | None = None
+    memory_type: MemoryType = MemoryType.SEMANTIC
+    key: str | None = None
+    content: str = Field(min_length=1)
+    value: Any = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    status: MemoryStatus = MemoryStatus.ACTIVE
+
+
+class MemoryStatusRequest(BaseModel):
+    tenant_id: str | None = None
+    user_id: str | None = None
+    status: MemoryStatus
+
+
+class MemoryItemResponse(BaseModel):
+    memory: dict[str, Any]
+
+
+class MemoryListResponse(BaseModel):
+    memories: list[dict[str, Any]]
 
 
 def _memory_path() -> Path:
@@ -275,14 +316,34 @@ def _fill_table_follow_up(question: str, context: dict[str, Any] | None) -> str:
     lowered = question.lower()
     if any(marker in question or marker in lowered for marker in (" 下", "表", "table", "collection", "select", "with")):
         return question
-    if not any(marker in question or marker in lowered for marker in ("count", "多少", "条数", "行数", "最近", "每天", "求和", "平均", "最大", "最小")):
+    if not any(marker in question or marker in lowered for marker in ("count", "多少", "条数", "行数", "最近", "每天", "求和", "平均", "最大", "最小", "增长", "下降", "变化", "对比", "环比", "哪部分")):
         return question
     table_name = str(context.get("table_name") or "")
     if not table_name:
         return question
     schema_name = str(context.get("schema_name") or "")
     prefix = f"{schema_name} 下{table_name}" if schema_name else table_name
-    return f"{prefix} {question}"
+    metric_phrase = _follow_up_metric_phrase(question, context)
+    return f"{prefix} {metric_phrase}{question}"
+
+
+def _follow_up_metric_phrase(question: str, context: dict[str, Any]) -> str:
+    lowered = question.lower()
+    if any(marker in question or marker in lowered for marker in ("count", "多少", "条数", "行数", "求和", "平均", "最大", "最小")):
+        return ""
+    aggregation = str(context.get("aggregation_function") or "count")
+    relative_days = context.get("relative_days")
+    time_grain = str(context.get("time_grain") or "")
+    parts: list[str] = []
+    if isinstance(relative_days, int) and relative_days > 0 and not any(marker in question for marker in ("最近", "近", "过去", "昨天", "上周")):
+        parts.append(f"最近{relative_days}天")
+    if time_grain == "day" and not any(marker in question or marker in lowered for marker in ("每天", "按天", "daily", "day")):
+        parts.append("每天的")
+    if aggregation == "count":
+        parts.append("数据count")
+    elif aggregation:
+        parts.append(f"数据{aggregation}")
+    return "".join(parts) + " "
 
 
 @dataclass
@@ -290,6 +351,10 @@ class _PreparedAsk:
     question: str
     dry_run: bool
     sql_approved: bool
+    tenant_id: str
+    user_id: str
+    memory_context: str = ""
+    skills_context: str = ""
 
 
 def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk | None]:
@@ -331,7 +396,16 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
             session_id=payload.session_id,
             memory=memory,
         ), None
-    return None, _PreparedAsk(question=question, dry_run=dry_run, sql_approved=sql_approved)
+    tenant_id, user_id, memory_context, skills_context = _load_contexts(settings, payload, question)
+    return None, _PreparedAsk(
+        question=question,
+        dry_run=dry_run,
+        sql_approved=sql_approved,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        memory_context=memory_context,
+        skills_context=skills_context,
+    )
 
 
 def _failed_ask(payload: AskRequest, exc: Exception) -> AskResponse:
@@ -369,11 +443,17 @@ def _finalize_ask(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any]
             selected_table = query_plan["table_name"]
             selected_schema = query_plan.get("schema_name")
         if selected_table:
-            _set_table_context(payload.session_id, {"schema_name": selected_schema, "table_name": selected_table})
+            data = {"schema_name": selected_schema, "table_name": selected_table}
+            if isinstance(query_plan, dict):
+                for key in ("aggregation_function", "relative_days", "time_grain", "date_field_name", "field_name"):
+                    if query_plan.get(key) is not None:
+                        data[key] = query_plan.get(key)
+            _set_table_context(payload.session_id, data)
         elif not suggestions and query_result.get("status") == "completed":
             _pop_table_context(payload.session_id)
     _remember(payload.session_id, "user", payload.question)
     memory = _remember(payload.session_id, "assistant", answer)
+    _record_long_term_memory(payload, run, result, answer)
     return AskResponse(
         answer=answer,
         query_plan=result.get("query_plan"),
@@ -389,6 +469,124 @@ def _use_tools(settings: Settings, dry_run: bool) -> bool:
     return settings.agent_mode == "tools" and bool(settings.openai_api_key) and not dry_run
 
 
+def _request_identity(payload: AskRequest, settings: Settings) -> tuple[str, str]:
+    tenant_id = payload.tenant_id or settings.agent_tenant_id or "default"
+    user_id = payload.user_id or settings.agent_user_id or payload.session_id
+    return tenant_id, user_id
+
+
+def _memory_admin_identity(settings: Settings, tenant_id: str | None, user_id: str | None) -> tuple[str, str]:
+    resolved_tenant = tenant_id or settings.agent_tenant_id or "default"
+    resolved_user = user_id or settings.agent_user_id
+    if not resolved_user:
+        raise HTTPException(status_code=400, detail="user_id is required when AGENT_USER_ID is not configured")
+    return resolved_tenant, resolved_user
+
+
+def _require_long_term_memory(settings: Settings) -> None:
+    if not settings.agent_long_term_memory_enabled:
+        raise HTTPException(status_code=400, detail="AGENT_LONG_TERM_MEMORY_ENABLED is false")
+
+
+def _memory_manager(settings: Settings) -> MemoryManager:
+    key = (
+        settings.agent_long_term_memory_enabled,
+        settings.agent_mongodb_uri,
+        settings.agent_mongodb_database,
+        settings.agent_memory_collection,
+        settings.agent_pgvector_dsn,
+        settings.agent_pgvector_table,
+        settings.agent_embedding_provider,
+        settings.agent_embedding_model,
+        settings.agent_embedding_dimensions,
+        settings.openai_api_key,
+        settings.openai_base_url,
+        settings.siliconflow_api_key,
+        settings.siliconflow_base_url,
+    )
+    manager = _MEMORY_MANAGER_CACHE.get(key)
+    if manager is None:
+        manager = build_memory_manager(settings)
+        _MEMORY_MANAGER_CACHE[key] = manager
+    return manager
+
+
+def _skill_registry(settings: Settings) -> SkillRegistry:
+    key = (settings.agent_skills_enabled, settings.agent_skills_path, settings.agent_skills_max_chars)
+    registry = _SKILL_REGISTRY_CACHE.get(key)
+    if registry is None:
+        registry = build_skill_registry(settings)
+        _SKILL_REGISTRY_CACHE[key] = registry
+    return registry
+
+
+def _checkpointing_enabled(settings: Settings) -> bool:
+    return settings.agent_checkpoint_backend.lower() == "mongodb"
+
+
+def _graph_config(settings: Settings, session_id: str) -> dict[str, Any] | None:
+    if not _checkpointing_enabled(settings):
+        return None
+    return {"configurable": {"thread_id": session_id}}
+
+
+def _checkpointer(settings: Settings) -> Any | None:
+    if not _checkpointing_enabled(settings):
+        return None
+    uri = settings.agent_checkpoint_mongodb_uri or settings.agent_mongodb_uri
+    if not uri:
+        raise RuntimeError("AGENT_CHECKPOINT_MONGODB_URI or AGENT_MONGODB_URI is required for MongoDB checkpointing")
+    key = (
+        settings.agent_checkpoint_backend,
+        uri,
+        settings.agent_checkpoint_mongodb_database,
+        settings.agent_checkpoint_ttl_seconds,
+    )
+    saver = _CHECKPOINTER_CACHE.get(key)
+    if saver is None:
+        from langgraph.checkpoint.mongodb import MongoDBSaver
+        from pymongo import MongoClient
+
+        ttl = settings.agent_checkpoint_ttl_seconds if settings.agent_checkpoint_ttl_seconds > 0 else None
+        saver = MongoDBSaver(MongoClient(uri), db_name=settings.agent_checkpoint_mongodb_database, ttl=ttl)
+        _CHECKPOINTER_CACHE[key] = saver
+    return saver
+
+
+def _load_contexts(settings: Settings, payload: AskRequest, question: str) -> tuple[str, str, str, str]:
+    tenant_id, user_id = _request_identity(payload, settings)
+    memory_context = ""
+    skills_context = ""
+    try:
+        memory_context = _memory_manager(settings).load_context(tenant_id=tenant_id, user_id=user_id, query=question).rendered
+    except Exception as exc:
+        _LOGGER.warning("memory.context.load failed: %s", exc)
+    try:
+        skills_context = _skill_registry(settings).render_context(question)
+    except Exception as exc:
+        _LOGGER.warning("skills.context.load failed: %s", exc)
+    return tenant_id, user_id, memory_context, skills_context
+
+
+def _record_long_term_memory(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any], answer: str) -> None:
+    settings = get_settings()
+    if not settings.agent_long_term_memory_enabled:
+        return
+    query_result = result.get("query_result")
+    query_plan = result.get("query_plan")
+    try:
+        _memory_manager(settings).record_interaction(
+            tenant_id=run.tenant_id,
+            user_id=run.user_id,
+            question=payload.question,
+            answer=answer,
+            query_result=query_result if isinstance(query_result, dict) else None,
+            query_plan=query_plan if isinstance(query_plan, dict) else None,
+        )
+    except Exception as exc:
+        _LOGGER.warning("memory.record_interaction failed: %s", exc)
+
+
 def _run_ask(payload: AskRequest) -> AskResponse:
     early, run = _prepare_ask(payload)
     if early is not None or run is None:
@@ -397,8 +595,18 @@ def _run_ask(payload: AskRequest) -> AskResponse:
     if _use_tools(settings, run.dry_run):
         return _run_ask_tools(payload, run, settings)
     graph = _get_graph(settings)
+    graph_input = {
+        "question": run.question,
+        "dry_run": run.dry_run,
+        "sql_approved": run.sql_approved,
+        "tenant_id": run.tenant_id,
+        "user_id": run.user_id,
+        "memory_context": run.memory_context,
+        "skills_context": run.skills_context,
+    }
+    graph_config = _graph_config(settings, payload.session_id)
     try:
-        result = graph.invoke({"question": run.question, "dry_run": run.dry_run, "sql_approved": run.sql_approved})
+        result = graph.invoke(graph_input, config=graph_config) if graph_config is not None else graph.invoke(graph_input)
     except Exception as exc:
         return _failed_ask(payload, exc)
     return _finalize_ask(payload, run, result)
@@ -417,8 +625,10 @@ def _tool_iterator(payload: AskRequest, run: _PreparedAsk, tools: AgentTools, tr
             tools,
             approved_sql=str(pending.get("sql") or ""),
             approved_tool_call_id=str(pending.get("tool_call_id") or ""),
+            memory_context=run.memory_context,
+            skills_context=run.skills_context,
         )
-    return iter_tool_loop(run.question, _history(payload.session_id), transport, tools)
+    return iter_tool_loop(run.question, _history(payload.session_id), transport, tools, memory_context=run.memory_context, skills_context=run.skills_context)
 
 
 def _finalize_tool_outcome(payload: AskRequest, run: _PreparedAsk, outcome: LoopOutcome) -> AskResponse:
@@ -430,6 +640,7 @@ def _finalize_tool_outcome(payload: AskRequest, run: _PreparedAsk, outcome: Loop
         query_result = outcome.last_result or {"status": outcome.status}
     _remember(payload.session_id, "user", payload.question)
     memory = _remember(payload.session_id, "assistant", outcome.answer)
+    _record_long_term_memory(payload, run, {"query_plan": {"intent": "tool_loop", "status": outcome.status}, "query_result": query_result}, outcome.answer)
     return AskResponse(
         answer=outcome.answer,
         query_plan={"intent": "tool_loop", "status": outcome.status},
@@ -485,13 +696,19 @@ def _get_graph(settings: Settings) -> Any:
                 settings.openai_base_url,
                 settings.openai_model,
                 settings.openai_wire_api,
+                settings.agent_checkpoint_backend,
+                settings.agent_mongodb_uri,
+                settings.agent_checkpoint_mongodb_uri,
+                settings.agent_checkpoint_mongodb_database,
+                str(settings.agent_checkpoint_ttl_seconds),
             )
         ).encode("utf-8")
     ).hexdigest()
     with _STATE_LOCK:
         graph = _GRAPH_CACHE.get(key)
         if graph is None:
-            graph = build_graph(settings)
+            checkpointer = _checkpointer(settings)
+            graph = build_graph(settings, checkpointer=checkpointer) if checkpointer is not None else build_graph(settings)
             _GRAPH_CACHE[key] = graph
     return graph
 
@@ -544,7 +761,69 @@ def create_app() -> FastAPI:
     @app.get("/api/sessions/{session_id}", response_model=SessionResponse)
     def session(session_id: str, x_agent_token: str | None = Header(default=None)) -> SessionResponse:
         _check_token(x_agent_token)
-        return SessionResponse(session_id=session_id, memory=_history(session_id))
+        pending = _get_approval(session_id)
+        pending_approval = {"status": "requires_approval", "sql": pending.get("sql")} if pending else None
+        return SessionResponse(session_id=session_id, memory=_history(session_id), pending_approval=pending_approval)
+
+    @app.get("/api/memories", response_model=MemoryListResponse)
+    def list_memories(
+        tenant_id: str | None = Query(default=None),
+        user_id: str | None = Query(default=None),
+        memory_type: MemoryType | None = Query(default=None),
+        status: MemoryStatus | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+        x_agent_token: str | None = Header(default=None),
+    ) -> MemoryListResponse:
+        _check_token(x_agent_token)
+        settings = get_settings()
+        _require_long_term_memory(settings)
+        resolved_tenant, resolved_user = _memory_admin_identity(settings, tenant_id, user_id)
+        records = _memory_manager(settings).list_memories(
+            tenant_id=resolved_tenant,
+            user_id=resolved_user,
+            memory_type=memory_type,
+            status=status,
+            limit=limit,
+        )
+        return MemoryListResponse(memories=[record.to_dict() for record in records])
+
+    @app.post("/api/memories", response_model=MemoryItemResponse)
+    def put_memory(payload: MemoryWriteRequest, x_agent_token: str | None = Header(default=None)) -> MemoryItemResponse:
+        _check_token(x_agent_token)
+        settings = get_settings()
+        _require_long_term_memory(settings)
+        tenant_id, user_id = _memory_admin_identity(settings, payload.tenant_id, payload.user_id)
+        record = _memory_manager(settings).put_memory(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            memory_type=payload.memory_type,
+            key=payload.key,
+            content=payload.content,
+            value=payload.value,
+            metadata=payload.metadata,
+            confidence=payload.confidence,
+            status=payload.status,
+            source="manual_api",
+        )
+        if record is None:
+            raise HTTPException(status_code=400, detail="memory was rejected by validation rules")
+        return MemoryItemResponse(memory=record.to_dict())
+
+    @app.post("/api/memories/{memory_id}/status", response_model=MemoryItemResponse)
+    def update_memory_status(memory_id: str, payload: MemoryStatusRequest, x_agent_token: str | None = Header(default=None)) -> MemoryItemResponse:
+        _check_token(x_agent_token)
+        settings = get_settings()
+        _require_long_term_memory(settings)
+        tenant_id, user_id = _memory_admin_identity(settings, payload.tenant_id, payload.user_id)
+        record = _memory_manager(settings).update_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            record_id=memory_id,
+            status=payload.status,
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail="memory not found")
+        return MemoryItemResponse(memory=record.to_dict())
 
     @app.post("/api/ask", response_model=AskResponse)
     def ask(payload: AskRequest, x_agent_token: str | None = Header(default=None)) -> AskResponse:
@@ -569,8 +848,19 @@ def create_app() -> FastAPI:
                 return
             graph = _get_graph(settings)
             result: dict[str, Any] = {}
+            graph_input = {
+                "question": run.question,
+                "dry_run": run.dry_run,
+                "sql_approved": run.sql_approved,
+                "tenant_id": run.tenant_id,
+                "user_id": run.user_id,
+                "memory_context": run.memory_context,
+                "skills_context": run.skills_context,
+            }
+            graph_config = _graph_config(settings, payload.session_id)
             try:
-                for chunk in graph.stream({"question": run.question, "dry_run": run.dry_run, "sql_approved": run.sql_approved}, stream_mode="updates"):
+                stream = graph.stream(graph_input, config=graph_config, stream_mode="updates") if graph_config is not None else graph.stream(graph_input, stream_mode="updates")
+                for chunk in stream:
                     for node, delta in chunk.items():
                         if isinstance(delta, dict):
                             result.update(delta)

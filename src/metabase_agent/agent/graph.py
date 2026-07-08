@@ -73,7 +73,7 @@ def _metric_answer(intent: str, source_name: str, result: dict[str, Any]) -> str
     return f"已基于 Metabase Metric `{source_name}` 完成查询，返回 {row_count} 行。"
 
 
-def build_graph(settings: Settings):
+def build_graph(settings: Settings, checkpointer: Any | None = None):
     client = MetabaseClient(settings.metabase_base_url, settings.metabase_api_key)
     bigquery_database_id = settings.metabase_bigquery_database_id
     report_range_start = settings.agent_report_range_start
@@ -92,6 +92,10 @@ def build_graph(settings: Settings):
         question = str(state.get("question", ""))
         parsed_intent = dict(parse_intent(question))
         trace = _append_trace(state, {"step": "parse.rule", "question": question, "intent": parsed_intent.get("intent"), "database_name": parsed_intent.get("database_name"), "schema_name": parsed_intent.get("schema_name")})
+        if str(state.get("memory_context", "")).strip():
+            trace = _append_trace({"trace": trace}, {"step": "memory.context", "status": "loaded"})
+        if str(state.get("skills_context", "")).strip():
+            trace = _append_trace({"trace": trace}, {"step": "skills.context", "status": "loaded"})
         if not state.get("dry_run"):
             try:
                 llm_intent = parse_intent_with_llm(question, settings)
@@ -313,4 +317,6 @@ def build_graph(settings: Settings):
     graph.add_edge("policy", "execute")
     graph.add_edge("execute", "answer")
     graph.add_edge("answer", END)
+    if checkpointer is not None:
+        return graph.compile(checkpointer=checkpointer)
     return graph.compile()

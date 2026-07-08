@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
+
 from metabase_agent.agent.tool_loop import ToolCall, run_tool_loop
 from metabase_agent.agent.tools import AgentTools, tool_schemas
 from metabase_agent.config.settings import Settings
@@ -43,6 +45,41 @@ def test_run_aggregation_tool_is_policy_checked_and_executes_in_dry_run() -> Non
     assert result["row_count"] == 1
 
 
+def test_run_aggregation_tool_falls_back_to_dataset_when_agent_query_rejects() -> None:
+    request = httpx.Request("POST", "https://example.test/api/agent/v2/query")
+    response = httpx.Response(400, request=request)
+    dataset_payloads: list[dict[str, Any]] = []
+
+    class _StubClient:
+        def list_databases(self) -> Any:
+            return {"data": [{"id": 19, "name": "BigQuery-GA", "engine": "bigquery"}]}
+
+        def get_database_schema(self, database_id: int, schema_name: str) -> Any:
+            return [{"id": 1332, "name": "orders", "schema": "business_data"}]
+
+        def get_table_query_metadata(self, table_id: int) -> dict[str, Any]:
+            return {"fields": [{"id": 305, "name": "created_at", "display_name": "created_at", "base_type": "type/DateTime"}]}
+
+        def query(self, program: dict[str, Any]) -> dict[str, Any]:
+            raise httpx.HTTPStatusError("bad request", request=request, response=response)
+
+        def execute_mbql_query(self, payload: dict[str, Any]) -> dict[str, Any]:
+            dataset_payloads.append(payload)
+            return {"status": "completed", "row_count": 1, "data": {"cols": [], "rows": [[1]]}}
+
+    tools = AgentTools(Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="k"), dry_run=False)
+    tools._client = _StubClient()  # type: ignore[assignment]
+
+    result = tools.dispatch(
+        "run_aggregation",
+        {"database_name": "BigQuery-GA", "schema_name": "business_data", "table_name": "orders", "aggregation": "count", "relative_days": 7, "time_grain": "day"},
+    )
+
+    assert result["status"] == "completed"
+    assert dataset_payloads[0]["database"] == 19
+    assert dataset_payloads[0]["query"]["source-table"] == 1332
+
+
 def test_run_sql_tool_blocks_mutations() -> None:
     result = _tools().dispatch("run_sql", {"sql": "DROP TABLE users"})
 
@@ -62,6 +99,23 @@ def test_loop_returns_answer_after_tool_call() -> None:
     assert outcome.answer == "当前有 3 个数据库。"
     assert outcome.status == "completed"
     assert any(event.get("tool") == "list_databases" for event in outcome.trace)
+
+
+def test_loop_injects_memory_and_skills_context() -> None:
+    transport = _ScriptedTransport(["完成。"])
+
+    run_tool_loop(
+        "有哪些数据库？",
+        [],
+        transport,
+        _tools(),
+        memory_context="长期记忆上下文：用户偏好中文。",
+        skills_context="可用任务技能：优先查询元数据。",
+    )
+
+    system_prompt = transport.calls[0]["messages"][0]["content"]
+    assert "长期记忆上下文" in system_prompt
+    assert "可用任务技能" in system_prompt
 
 
 def test_loop_suspends_for_sql_approval() -> None:

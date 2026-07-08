@@ -42,6 +42,7 @@ from metabase_agent.agent.trace import append_trace as _append_trace
 from metabase_agent.query.query_program_builder import (
     _table_aggregation_v1_payload,
     build_table_aggregation_program,
+    table_aggregation_dataset_payload,
 )
 from metabase_agent.tools.metabase.client import MetabaseClient
 
@@ -57,6 +58,7 @@ class _MetadataRequest:
     aggregation_function: str
     relative_days: int | None
     time_grain: str | None
+    raw_question: str
 
     @classmethod
     def from_state(cls, state: AgentState) -> _MetadataRequest:
@@ -71,6 +73,7 @@ class _MetadataRequest:
             aggregation_function=str(parsed.get("aggregation_function") or ""),
             relative_days=cast(int | None, parsed.get("relative_days")),
             time_grain=cast(str | None, parsed.get("time_grain")),
+            raw_question=str(parsed.get("raw_question") or state.get("question") or ""),
         )
 
 
@@ -156,7 +159,7 @@ def run_database_metadata(state: AgentState, client: MetabaseClient) -> AgentSta
         table = _find_table(tables, req.table_name)
         if table is None:
             return _table_not_found(req, database_display_name, database_names, tables, table_names, trace)
-        return _table_aggregation(state, client, req, database_display_name, table, trace)
+        return _table_aggregation(state, client, req, database_display_name, database_id if not dry_run else None, table, trace)
 
     return {
         "answer": f"`{database_display_name}`" + (f" 下 `{req.schema_name}`" if req.schema_name else " 数据库") + f"共有 {len(table_names)} 个表。",
@@ -223,7 +226,7 @@ def _table_field_list(state: AgentState, client: MetabaseClient, req: _MetadataR
     }
 
 
-def _table_aggregation(state: AgentState, client: MetabaseClient, req: _MetadataRequest, database_display_name: str, table: dict[str, Any], trace: list[dict[str, Any]]) -> AgentState:
+def _table_aggregation(state: AgentState, client: MetabaseClient, req: _MetadataRequest, database_display_name: str, database_id: int | None, table: dict[str, Any], trace: list[dict[str, Any]]) -> AgentState:
     table_display_name = str(table.get("name", req.table_name))
     if state.get("dry_run"):
         fields_payload = _dry_table_query_metadata()
@@ -233,9 +236,15 @@ def _table_aggregation(state: AgentState, client: MetabaseClient, req: _Metadata
         fields_payload = client.get_table_query_metadata(int(table["id"]))
         trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/table/{int(table['id'])}/query_metadata", "field_count": len(_fields(fields_payload))})
         trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": f"GET /api/agent/v1/table/{int(table['id'])}"})
-        agent_table_payload = client.get_table(int(table["id"]))
-        agent_fields = _fields(agent_table_payload)
-        trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/agent/v1/table/{int(table['id'])}", "field_count": len(agent_fields)})
+        try:
+            agent_table_payload = client.get_table(int(table["id"]))
+            agent_fields = _fields(agent_table_payload)
+            trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/agent/v1/table/{int(table['id'])}", "field_count": len(agent_fields)})
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
+            agent_fields = []
+            trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": f"GET /api/agent/v1/table/{int(table['id'])}", "status": "not_found", "fallback": "GET /api/table/{table_id}/query_metadata"})
     fields = _fields(fields_payload)
     field = None
     if req.aggregation_function != "count":
@@ -293,9 +302,9 @@ def _table_aggregation(state: AgentState, client: MetabaseClient, req: _Metadata
         else:
             query_result = {"status": "completed", "data": {"cols": [{"display_name": req.aggregation_function}], "rows": [[3]]}, "row_count": 1}
     else:
-        query_result, trace = _execute_aggregation(client, program, trace)
+        query_result, trace = _execute_aggregation(client, database_id, program, trace)
     return {
-        "answer": f"已对 `{table_display_name}` 执行 `{req.aggregation_function}` 聚合。",
+        "answer": _table_aggregation_answer(req, table_display_name, query_result),
         "query_plan": query_plan,
         "program": program,
         "query_result": query_result,
@@ -303,14 +312,75 @@ def _table_aggregation(state: AgentState, client: MetabaseClient, req: _Metadata
     }
 
 
-def _execute_aggregation(client: MetabaseClient, program: dict[str, Any], trace: list[dict[str, Any]]) -> tuple[Any, list[dict[str, Any]]]:
+def _table_aggregation_answer(req: _MetadataRequest, table_display_name: str, query_result: Any) -> str:
+    base = f"已对 `{table_display_name}` 执行 `{req.aggregation_function}` 聚合。"
+    if not _asks_for_growth_analysis(req.raw_question):
+        return base
+    rows = _result_rows(query_result)
+    if len(rows) < 2:
+        return base + " 结果不足两天，暂时无法判断最近两天是否增长。"
+    previous, latest = rows[-2], rows[-1]
+    previous_value = _last_numeric_cell(previous)
+    latest_value = _last_numeric_cell(latest)
+    if previous_value is None or latest_value is None:
+        return base + " 结果中没有可比较的数值列，暂时无法判断最近两天是否增长。"
+    delta = latest_value - previous_value
+    pct = f"，变化率 {delta / previous_value * 100:+.1f}%" if previous_value else ""
+    trend = "增长" if delta > 0 else "下降" if delta < 0 else "持平"
+    previous_label = _row_label(previous)
+    latest_label = _row_label(latest)
+    answer = f"`{table_display_name}` 最近两天总量{trend}：{previous_label} 为 {previous_value:g}，{latest_label} 为 {latest_value:g}，变化 {delta:+g}{pct}。"
+    if _asks_for_breakdown(req.raw_question):
+        answer += " 当前查询未指定拆分维度，因此只能判断总量；要分析“哪部分增长”，请指定按哪个字段拆分，例如状态、来源、类型、渠道或具体字段名。"
+    return answer
+
+
+def _asks_for_growth_analysis(question: str) -> bool:
+    return any(word in question for word in ("增长", "下降", "变多", "变少", "是否增", "是否涨", "变化", "对比", "环比"))
+
+
+def _asks_for_breakdown(question: str) -> bool:
+    return any(word in question for word in ("哪部分", "哪些部分", "哪里", "哪个", "哪些", "来源", "维度"))
+
+
+def _result_rows(query_result: Any) -> list[Any]:
+    if not isinstance(query_result, dict):
+        return []
+    data = query_result.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+        return []
+    return data["rows"]
+
+
+def _last_numeric_cell(row: Any) -> float | None:
+    cells = row if isinstance(row, list) else [row]
+    for cell in reversed(cells):
+        if isinstance(cell, bool):
+            continue
+        if isinstance(cell, int | float):
+            return float(cell)
+    return None
+
+
+def _row_label(row: Any) -> str:
+    if isinstance(row, list) and row:
+        return str(row[0])
+    return "上一项"
+
+
+def _execute_aggregation(client: MetabaseClient, database_id: int | None, program: dict[str, Any], trace: list[dict[str, Any]]) -> tuple[Any, list[dict[str, Any]]]:
     query_program = {"source": program["source"], "operations": program["operations"]}
     trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": "POST /api/agent/v2/query", "program": query_program})
     try:
         return client.query(query_program), trace
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code != 404:
+        if exc.response.status_code not in {400, 404}:
             raise
+        if database_id is not None:
+            payload = table_aggregation_dataset_payload(database_id, program)
+            trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": "POST /api/agent/v2/query", "status": "failed", "status_code": exc.response.status_code, "fallback": "POST /api/dataset"})
+            trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": "POST /api/dataset", "payload": payload})
+            return client.execute_mbql_query(payload), trace
         v1_payload = _table_aggregation_v1_payload(program)
         trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": "POST /api/agent/v2/query", "status": "not_found", "fallback": "POST /api/agent/v1/construct-query"})
         trace = _append_trace({"trace": trace}, {"step": "metabase.request", "endpoint": "POST /api/agent/v1/construct-query", "payload": v1_payload})

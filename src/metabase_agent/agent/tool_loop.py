@@ -37,8 +37,13 @@ class LLMTransport(Protocol):
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str | list[ToolCall]: ...
 
 
-def _build_messages(question: str, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT}]
+def _build_messages(question: str, history: list[dict[str, Any]], *, memory_context: str = "", skills_context: str = "") -> list[dict[str, Any]]:
+    system_prompt = _SYSTEM_PROMPT
+    if memory_context.strip():
+        system_prompt = f"{system_prompt}\n\n{memory_context.strip()}"
+    if skills_context.strip():
+        system_prompt = f"{system_prompt}\n\n{skills_context.strip()}"
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     if question:
         messages.append({"role": "user", "content": question})
@@ -54,6 +59,8 @@ def run_tool_loop(
     max_iterations: int = 6,
     approved_sql: str | None = None,
     approved_tool_call_id: str | None = None,
+    memory_context: str = "",
+    skills_context: str = "",
 ) -> LoopOutcome:
     outcome = LoopOutcome(status="exhausted")
     for kind, payload in iter_tool_loop(
@@ -64,6 +71,8 @@ def run_tool_loop(
         max_iterations=max_iterations,
         approved_sql=approved_sql,
         approved_tool_call_id=approved_tool_call_id,
+        memory_context=memory_context,
+        skills_context=skills_context,
     ):
         if kind == "outcome":
             outcome = payload
@@ -79,6 +88,8 @@ def iter_tool_loop(
     max_iterations: int = 6,
     approved_sql: str | None = None,
     approved_tool_call_id: str | None = None,
+    memory_context: str = "",
+    skills_context: str = "",
 ) -> Iterator[tuple[str, Any]]:
     schemas = tool_schemas()
     last_result: dict[str, Any] | None = None
@@ -89,7 +100,7 @@ def iter_tool_loop(
         trace: list[dict[str, Any]] = [{"step": "tool.result", "tool": "run_sql", "status": last_result.get("status"), "approved": True}]
         messages.append(_tool_result_message(approved_tool_call_id or "run_sql", "run_sql", last_result))
     else:
-        messages = _build_messages(question, history)
+        messages = _build_messages(question, history, memory_context=memory_context, skills_context=skills_context)
         trace = []
 
     for _ in range(max_iterations):

@@ -222,6 +222,8 @@ cp .env.example .env
 | `OPENAI_MODEL` | `gpt-5` | 模型名 |
 | `OPENAI_WIRE_API` | `chat_completions` | `chat_completions`（SDK）或 `responses`（裸 httpx） |
 | `OPENAI_TIMEOUT` | `120` | LLM 请求超时（秒） |
+| `SILICONFLOW_API_KEY` | 空 | SiliconFlow embedding key；`AGENT_EMBEDDING_PROVIDER=siliconflow` 时必填 |
+| `SILICONFLOW_BASE_URL` | `https://api.siliconflow.cn/v1` | SiliconFlow API base URL |
 | `METABASE_BASE_URL` | 空 | Metabase 实例地址 |
 | `METABASE_API_KEY` | 空 | 只读权限的 Metabase API Key |
 | `AGENT_DRY_RUN` | `true` | true=本地样例（离线、无需 key） |
@@ -232,6 +234,24 @@ cp .env.example .env
 | `AGENT_STATE_PATH` | `.metabase_agent_state.json` | 审批/表上下文文件；sqlite 模式指向 `.db` |
 | `AGENT_MEMORY_PATH` | `.metabase_agent_memory.json` | 会话记忆文件（memory 后端） |
 | `AGENT_SESSION_TTL_SECONDS` | `0` | 会话过期秒数，0=不过期（仅 sqlite） |
+| `AGENT_CHECKPOINT_BACKEND` | `none` | LangGraph checkpoint 后端；`mongodb` 启用 MongoDBSaver |
+| `AGENT_CHECKPOINT_MONGODB_URI` | 空 | MongoDBSaver URI；空时复用 `AGENT_MONGODB_URI` |
+| `AGENT_CHECKPOINT_MONGODB_DATABASE` | `metabase_agent_checkpoints` | MongoDBSaver database |
+| `AGENT_CHECKPOINT_TTL_SECONDS` | `0` | checkpoint TTL 秒数，0=不过期 |
+| `AGENT_TENANT_ID` | `default` | 长期记忆租户 ID |
+| `AGENT_USER_ID` | 空 | 长期记忆用户 ID；API 为空时默认用 `session_id` |
+| `AGENT_LONG_TERM_MEMORY_ENABLED` | `false` | 是否启用 MongoDB + pgvector 长期记忆 |
+| `AGENT_MONGODB_URI` | 空 | 长期记忆 MongoDB URI |
+| `AGENT_MONGODB_DATABASE` | `metabase_agent` | 长期记忆 MongoDB database |
+| `AGENT_MEMORY_COLLECTION` | `agent_memories` | 长期记忆集合 |
+| `AGENT_PGVECTOR_DSN` | 空 | pgvector PostgreSQL DSN |
+| `AGENT_PGVECTOR_TABLE` | `memory_embeddings` | pgvector 表名 |
+| `AGENT_EMBEDDING_PROVIDER` | `hash` | `hash`（离线/测试）、`openai` 或 `siliconflow` |
+| `AGENT_EMBEDDING_MODEL` | `text-embedding-3-small` | embedding 模型；SiliconFlow 可用 `BAAI/bge-m3` |
+| `AGENT_EMBEDDING_DIMENSIONS` | `1536` | embedding 维度；pgvector 表也必须使用相同维度 |
+| `AGENT_SKILLS_ENABLED` | `true` | 是否启用 `skills/*/SKILL.md` 上下文注入 |
+| `AGENT_SKILLS_PATH` | `skills` | skills 根目录 |
+| `AGENT_SKILLS_MAX_CHARS` | `6000` | 每次注入 skills 上下文最大字符数 |
 | `METABASE_BIGQUERY_DATABASE_ID` | `19` | BigQuery 库的 Metabase database id |
 | `AGENT_REPORT_RANGE_START` / `_END_EXCLUSIVE` / `_TIMEZONE` | `2025-11-01` / `2026-05-01` / `US/Pacific` | 月度用量报表的时间范围与时区 |
 
@@ -308,6 +328,8 @@ docker run --env-file .env -p 8765:8765 metabase-agent
 - **CLI tools 审批**：CLI 为单次执行，触发 `run_sql` 审批时只打印 SQL，不支持交互式授权（请用 Web 端）。
 - **业务默认值**：`METABASE_BIGQUERY_DATABASE_ID`、报表日期等仍是 akool 部署默认值，开源/换环境前应清空。
 - **CI/Docker 实跑**：CI 工作流与 Dockerfile 已就绪，需推到远端 + 启 Docker daemon 验证。
+- **长期记忆**：已加入 MongoDB 结构化 memory repository、pgvector 向量索引接口、skills 解析注入；默认关闭长期记忆，详见 `docs/memory-skills-implementation.md`。
+- **pgvector 初始化**：启用长期记忆前先设置 `AGENT_PGVECTOR_DSN`，再运行 `uv run python scripts/init_pgvector_memory.py` 建表和索引。
 
 ---
 

@@ -7,6 +7,10 @@ class AgentState(TypedDict, total=False):
     question: str
     dry_run: bool
     sql_approved: bool
+    memory_context: str
+    skills_context: str
+    tenant_id: str
+    user_id: str
     parsed_intent: dict[str, Any]
     search_result: dict[str, Any]
     selected_entity: dict[str, Any] | None

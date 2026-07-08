@@ -82,3 +82,47 @@ def _table_aggregation_v1_payload(program: dict[str, Any]) -> dict[str, Any]:
     if group_by:
         payload["group_by"] = group_by
     return payload
+
+
+def table_aggregation_dataset_payload(database_id: int, program: dict[str, Any]) -> dict[str, Any]:
+    query: dict[str, Any] = {"source-table": program["source"]["id"]}
+    for operation in program["operations"]:
+        if not operation:
+            continue
+        op = operation[0]
+        if op == "filter":
+            query["filter"] = _combine_filters(query.get("filter"), _mbql_expression(operation[1]))
+        elif op == "aggregate":
+            query["aggregation"] = [_mbql_aggregation(operation[1])]
+        elif op == "breakout":
+            query.setdefault("breakout", []).append(_mbql_expression(operation[1]))
+        elif op == "order-by":
+            query.setdefault("order-by", []).append([operation[2], _mbql_expression(operation[1])])
+        elif op == "limit":
+            query["limit"] = operation[1]
+    return {"database": database_id, "type": "query", "query": query, "parameters": []}
+
+
+def _combine_filters(existing: Any | None, new_filter: list[Any]) -> list[Any]:
+    if existing is None:
+        return new_filter
+    return ["and", existing, new_filter]
+
+
+def _mbql_aggregation(aggregation: list[Any]) -> list[Any]:
+    if len(aggregation) == 1:
+        return [aggregation[0]]
+    return [aggregation[0], _mbql_expression(aggregation[1])]
+
+
+def _mbql_expression(expression: list[Any]) -> list[Any]:
+    op = expression[0]
+    if op == "field":
+        options = expression[2] if len(expression) > 2 else None
+        return ["field", expression[1], options]
+    if op == "time-interval":
+        return ["time-interval", _mbql_expression(expression[1]), expression[2], expression[3]]
+    if op == "with-temporal-bucket":
+        field = _mbql_expression(expression[1])
+        return ["field", field[1], {"temporal-unit": expression[2]}]
+    return expression
