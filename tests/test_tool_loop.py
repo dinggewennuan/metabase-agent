@@ -475,9 +475,10 @@ def test_chat_httpx_adapter_parses_tool_calls_without_sdk_headers(monkeypatch) -
     assert isinstance(reply, list)
     assert reply[0].name == "list_databases"
     assert captured["url"].endswith("/chat/completions")
-    # No SDK fingerprint headers — only auth and content type, so gateway
-    # WAFs that 403 the OpenAI SDK accept these requests.
-    assert set(captured["headers"]) == {"Authorization", "Content-Type"}
+    # No SDK fingerprint headers (x-stainless-*), and never httpx's default
+    # "python-httpx/x.y" User-Agent — both are stock gateway-WAF block rules.
+    assert set(captured["headers"]) == {"Authorization", "Content-Type", "User-Agent"}
+    assert "python" not in captured["headers"]["User-Agent"].lower()
     assert captured["json"]["tools"][0]["type"] == "function"
 
 
@@ -505,3 +506,74 @@ def test_build_tool_transport_selects_chat_httpx(monkeypatch) -> None:
     transport = llm_client.build_tool_transport(Settings(OPENAI_API_KEY="k", OPENAI_WIRE_API="chat_completions_httpx"))
 
     assert isinstance(transport, llm_client.ChatHttpxToolTransport)
+
+
+def test_chat_httpx_retries_with_minimal_body_when_gateway_rejects_extras(monkeypatch) -> None:
+    from metabase_agent.semantics import llm_client
+
+    attempts: list[dict[str, Any]] = []
+
+    class _Resp:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "https://gw.test/v1/chat/completions")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("blocked", request=request, response=response)
+
+        def json(self) -> dict[str, Any]:
+            return {"choices": [{"message": {"content": "pong"}}]}
+
+    def _fake_post(url: str, **kwargs: Any) -> _Resp:
+        body = kwargs.get("json") or {}
+        attempts.append(body)
+        # The gateway 403s any request carrying params beyond {model, messages, tools}.
+        blocked = any(key in body for key in ("reasoning_effort", "response_format", "temperature"))
+        return _Resp(403 if blocked else 200)
+
+    monkeypatch.setattr(llm_client.httpx, "post", _fake_post)
+    settings = Settings(OPENAI_API_KEY="k", OPENAI_WIRE_API="chat_completions_httpx")
+
+    text = llm_client.complete("system", "user", settings, json_mode=True)
+
+    assert text == "pong"
+    assert len(attempts) == 2
+    # Second attempt is the verified-working minimal shape.
+    assert set(attempts[1]) == {"model", "messages"}
+
+
+def test_chat_httpx_transport_retries_without_reasoning_effort(monkeypatch) -> None:
+    from metabase_agent.semantics import llm_client
+
+    attempts: list[dict[str, Any]] = []
+
+    class _Resp:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "https://gw.test/v1/chat/completions")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("blocked", request=request, response=response)
+
+        def json(self) -> dict[str, Any]:
+            return {"choices": [{"message": {"content": "done"}}]}
+
+    def _fake_post(url: str, **kwargs: Any) -> _Resp:
+        body = kwargs.get("json") or {}
+        attempts.append(body)
+        return _Resp(403 if "reasoning_effort" in body else 200)
+
+    monkeypatch.setattr(llm_client.httpx, "post", _fake_post)
+    transport = llm_client.ChatHttpxToolTransport(Settings(OPENAI_API_KEY="k", OPENAI_WIRE_API="chat_completions_httpx"))
+
+    reply = transport.complete([{"role": "user", "content": "q"}], tool_schemas())
+
+    assert reply == "done"
+    assert len(attempts) == 2
+    # tools must survive the fallback — only the optional extras are dropped.
+    assert "tools" in attempts[1]
+    assert "reasoning_effort" not in attempts[1]

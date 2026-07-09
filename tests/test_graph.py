@@ -169,7 +169,9 @@ def test_graph_dry_run_table_query_requires_database_confirmation() -> None:
     assert result["query_result"]["status"] == "requires_clarification"
     assert result["query_result"]["clarification_type"] == "database"
     assert result["query_result"]["available_databases"] == ["BigQuery-GA", "business_data", "product_data"]
-    assert result["query_result"]["suggestions"][0] == "查询BigQuery-GA 下orders 这个表的数据count"
+    # "X数据库" anchor, NOT "查询X 下orders": the 下-phrasing makes the parser
+    # treat the table name as a schema and the schema filter finds nothing.
+    assert result["query_result"]["suggestions"][0] == "BigQuery-GA数据库 orders 这个表的数据count"
 
 
 def test_graph_dry_run_missing_table_lists_available_tables() -> None:

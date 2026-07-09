@@ -14,6 +14,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from metabase_agent.agent.clarify import database_scoped_question
 from metabase_agent.agent.graph import build_graph
 from metabase_agent.agent.sql_review import program_fingerprint
 from metabase_agent.agent.tool_loop import LoopOutcome, iter_tool_loop
@@ -332,8 +333,54 @@ def _is_sql_rejection(question: str, decision: str | None = None) -> bool:
     return any(phrase in question or phrase in lowered for phrase in _REJECTION_PHRASES)
 
 
+# Markers that mean the reply is a full new request of its own, not just the
+# answer to "which database?".
+_NEW_INTENT_MARKERS = ("下", "表", "哪些", "多少", "字段", "count", "sum", "avg", "select", "with", "最近", "每天")
+_GROWTH_MARKERS = ("增长", "下降", "变多", "变少", "是否增", "是否涨", "变化", "对比", "环比")
+
+
+def _fill_database_clarification_follow_up(question: str, context: dict[str, Any] | None) -> str | None:
+    """Resume the pending request when the user answers a database question.
+
+    After the agent asks "which database is table X in?", the next message is
+    usually just the database name ("BigQuery-GA"). Parsed in isolation that
+    becomes a brand-new question (list tables / metric lookup) and the original
+    aggregation request is silently dropped — so rewrite it back into the full
+    pending question instead.
+    """
+    if not context or context.get("awaiting_clarification") != "database":
+        return None
+    table_name = str(context.get("table_name") or "")
+    if not table_name:
+        return None
+    if extract_native_sql(question):
+        return None
+    databases = [str(name) for name in context.get("available_databases") or [] if name]
+    lowered = question.lower()
+    matched = [name for name in databases if name.lower() in lowered]
+    if len(matched) != 1:
+        return None
+    # Anything meaningful left after removing the database name means the user
+    # asked a new question that merely mentions the database — don't hijack it.
+    residue = lowered.replace(matched[0].lower(), " ")
+    if any(marker in residue for marker in _NEW_INTENT_MARKERS):
+        return None
+    relative_days = context.get("relative_days")
+    rewritten = database_scoped_question(
+        matched[0],
+        table_name,
+        str(context.get("aggregation_function") or "") or None,
+        relative_days if isinstance(relative_days, int) else None,
+        str(context.get("time_grain") or "") or None,
+    )
+    raw_question = str(context.get("raw_question") or "")
+    if any(marker in raw_question for marker in _GROWTH_MARKERS):
+        rewritten += "，并分析是否增长，哪部分变化明显"
+    return rewritten
+
+
 def _fill_table_follow_up(question: str, context: dict[str, Any] | None) -> str:
-    if not context:
+    if not context or context.get("awaiting_clarification"):
         return question
     lowered = question.lower()
     if any(marker in question or marker in lowered for marker in (" 下", "表", "table", "collection", "select", "with")):
@@ -421,7 +468,15 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
         question = str(approved.get("question") or question)
         sql_approved = True
     else:
-        question = _fill_table_follow_up(question, _get_table_context(payload.session_id))
+        context = _get_table_context(payload.session_id)
+        rewritten = _fill_database_clarification_follow_up(question, context)
+        if rewritten is not None:
+            question = rewritten
+            # Consume the awaiting state so a later bare database mention
+            # can't resurrect a stale pending request.
+            _pop_table_context(payload.session_id)
+        else:
+            question = _fill_table_follow_up(question, context)
     memory_answer = None if _use_tools(settings, dry_run) else _answer_from_memory(payload.question, history)
     if memory_answer is not None:
         _remember(payload.session_id, "user", payload.question)
@@ -484,6 +539,21 @@ def _finalize_ask(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any]
     if isinstance(query_result, dict):
         query_plan = result.get("query_plan")
         suggestions = query_result.get("suggestions")
+        if query_result.get("status") == "requires_clarification" and query_result.get("clarification_type") == "database" and isinstance(query_result.get("table_name"), str):
+            # Remember what we asked, so the user can answer with just a
+            # database name and we resume the original request.
+            _set_table_context(
+                payload.session_id,
+                {
+                    "awaiting_clarification": "database",
+                    "table_name": query_result["table_name"],
+                    "aggregation_function": query_result.get("aggregation_function"),
+                    "relative_days": query_result.get("relative_days"),
+                    "time_grain": query_result.get("time_grain"),
+                    "available_databases": query_result.get("available_databases") or [],
+                    "raw_question": run.question,
+                },
+            )
         selected_table = None
         selected_schema = query_result.get("schema_name")
         # Only a COMPLETED query fixes the follow-up table context; candidate

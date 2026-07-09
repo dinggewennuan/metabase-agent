@@ -31,13 +31,18 @@ def _table_candidate_suggestions(intent: str, candidates: list[tuple[dict[str, A
 
 
 def _database_clarification_suggestions(database_names: list[str], table_name: str, aggregation_function: str | None, relative_days: int | None, time_grain: str | None) -> list[str]:
-    suggestions: list[str] = []
-    for database_name in database_names[:8]:
-        if aggregation_function:
-            if relative_days and time_grain == "day":
-                suggestions.append(f"查询{database_name} 下{table_name} 最近{relative_days}天的每天的数据{aggregation_function}")
-            else:
-                suggestions.append(f"查询{database_name} 下{table_name} 这个表的数据{aggregation_function}")
-        else:
-            suggestions.append(f"查询{database_name} 下{table_name} 这个表有哪些字段？")
-    return suggestions
+    return [database_scoped_question(database_name, table_name, aggregation_function, relative_days, time_grain) for database_name in database_names[:8]]
+
+
+def database_scoped_question(database_name: str, table_name: str, aggregation_function: str | None, relative_days: int | None, time_grain: str | None) -> str:
+    """Compose a full question that pins BOTH the database and the table.
+
+    Uses the "X数据库" anchor instead of "查询X 下Y": the "下" phrasing makes the
+    rule parser read the TABLE name as a schema, and on real BigQuery databases
+    the schema filter then matches nothing and the table is never found.
+    """
+    if aggregation_function:
+        if relative_days and time_grain == "day":
+            return f"{database_name}数据库 {table_name} 这个表最近{relative_days}天的每天的数据{aggregation_function}"
+        return f"{database_name}数据库 {table_name} 这个表的数据{aggregation_function}"
+    return f"{database_name}数据库 {table_name} 这个表有哪些字段？"

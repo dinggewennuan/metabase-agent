@@ -59,10 +59,24 @@ def complete(system_prompt: str, user_content: str, settings: Settings, *, json_
     return _complete_chat(system_prompt, user_content, settings, json_mode=json_mode)
 
 
+# Explicit neutral User-Agent: httpx's default is "python-httpx/x.y" and
+# "python-*" agents are a stock gateway-WAF block rule (the same WAFs accept
+# Postman/curl). Never let the default leak through.
+_HTTPX_HEADERS_UA = "metabase-agent/0.1"
+
+
+def _llm_headers(settings: Settings) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {settings.openai_api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": _HTTPX_HEADERS_UA,
+    }
+
+
 def _complete_responses(system_prompt: str, user_content: str, settings: Settings) -> str:
     response = httpx.post(
         f"{settings.openai_base_url.rstrip('/')}/responses",
-        headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+        headers=_llm_headers(settings),
         json={
             "model": settings.openai_model,
             "input": f"{system_prompt}\n\n{user_content}",
@@ -78,17 +92,33 @@ def _complete_responses(system_prompt: str, user_content: str, settings: Setting
 
 
 def _post_chat_completions(settings: Settings, body: dict[str, Any]) -> dict[str, Any]:
-    # Plain httpx with only Authorization/Content-Type: no SDK fingerprint
-    # headers for a gateway WAF to block.
+    # Plain httpx with only auth/content-type/UA: no SDK fingerprint headers
+    # (x-stainless-*) for a gateway WAF to block.
     response = httpx.post(
         f"{settings.openai_base_url.rstrip('/')}/chat/completions",
-        headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+        headers=_llm_headers(settings),
         json=body,
         timeout=settings.openai_timeout,
     )
     response.raise_for_status()
     payload = response.json()
     return payload if isinstance(payload, dict) else {}
+
+
+# Body keys beyond the bare {model, messages, tools} minimum. Some gateways
+# 4xx on any of them; the verified-working request shape is the minimal one,
+# so on a 4xx we retry once without the extras.
+_OPTIONAL_CHAT_KEYS = ("reasoning_effort", "response_format", "temperature")
+
+
+def _post_chat_completions_with_fallback(settings: Settings, body: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _post_chat_completions(settings, body)
+    except httpx.HTTPStatusError as exc:
+        minimal = {key: value for key, value in body.items() if key not in _OPTIONAL_CHAT_KEYS}
+        if exc.response.status_code >= 500 or minimal == body:
+            raise
+        return _post_chat_completions(settings, minimal)
 
 
 def _chat_payload_message(payload: dict[str, Any]) -> dict[str, Any]:
@@ -109,14 +139,12 @@ def _complete_chat_httpx(system_prompt: str, user_content: str, settings: Settin
         ],
     }
     if json_mode:
-        try:
-            payload = _post_chat_completions(settings, {**body, "temperature": 0, "response_format": {"type": "json_object"}})
-        except httpx.HTTPStatusError:
-            # Same fallback as the SDK path: gateways that reject
-            # response_format still get a plain JSON-by-prompt attempt.
-            payload = _post_chat_completions(settings, {**body, "temperature": 0})
+        # response_format/temperature/reasoning_effort are all dropped by the
+        # fallback if the gateway rejects them; JSON shape is then enforced by
+        # the prompt alone, same as the SDK path's degradation.
+        payload = _post_chat_completions_with_fallback(settings, {**body, "temperature": 0, "response_format": {"type": "json_object"}})
     else:
-        payload = _post_chat_completions(settings, body)
+        payload = _post_chat_completions_with_fallback(settings, body)
     text = str(_chat_payload_message(payload).get("content") or "")
     if not text.strip():
         raise RuntimeError("empty LLM response")
@@ -198,7 +226,7 @@ class ResponsesToolTransport:
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str | list[ToolCall]:
         response = httpx.post(
             f"{self.settings.openai_base_url.rstrip('/')}/responses",
-            headers={"Authorization": f"Bearer {self.settings.openai_api_key}", "Content-Type": "application/json"},
+            headers=_llm_headers(self.settings),
             json={
                 "model": self.settings.openai_model,
                 "input": _responses_input(messages),
@@ -248,7 +276,7 @@ class ChatHttpxToolTransport:
         self.settings = settings
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str | list[ToolCall]:
-        payload = _post_chat_completions(
+        payload = _post_chat_completions_with_fallback(
             self.settings,
             {
                 "model": self.settings.openai_model,

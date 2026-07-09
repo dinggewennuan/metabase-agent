@@ -121,7 +121,19 @@ def run_database_metadata(state: AgentState, client: MetabaseClient) -> AgentSta
         return {
             "answer": f"请先确认要在哪个数据库中查询 `{req.table_name}`。当前可访问数据库：" + "、".join(database_names),
             "query_plan": {"intent": req.intent, "table_name": req.table_name, "requires_clarification": True, "clarification_type": "database"},
-            "query_result": {"status": "requires_clarification", "clarification_type": "database", "table_name": req.table_name, "available_databases": database_names, "suggestions": _database_clarification_suggestions(database_names, req.table_name, req.aggregation_function, req.relative_days, req.time_grain)},
+            # The pending request parameters ride along so the session can
+            # resume the ORIGINAL question when the user answers with just a
+            # database name.
+            "query_result": {
+                "status": "requires_clarification",
+                "clarification_type": "database",
+                "table_name": req.table_name,
+                "aggregation_function": req.aggregation_function or None,
+                "relative_days": req.relative_days,
+                "time_grain": req.time_grain,
+                "available_databases": database_names,
+                "suggestions": _database_clarification_suggestions(database_names, req.table_name, req.aggregation_function, req.relative_days, req.time_grain),
+            },
             "trace": _append_trace({"trace": trace}, {"step": "metadata.clarify_database", "status": "requires_clarification", "table_name": req.table_name, "available_databases": database_names}),
         }
 

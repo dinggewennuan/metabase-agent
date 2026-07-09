@@ -676,3 +676,47 @@ def test_ask_api_approval_bound_to_reviewed_program() -> None:
     data = approved.json()
     assert data["query_result"]["status"] == "requires_approval"
     assert "不一致" in data["answer"]
+
+
+def test_ask_api_database_answer_resumes_pending_clarification() -> None:
+    client = TestClient(create_app())
+
+    first = client.post("/api/ask", json={"question": "orders 这个表最近7天的每天的数据count，并分析是否增长", "dry_run": True, "session_id": "clarify-db"})
+    # The reply is ONLY a database name — it must resume the pending
+    # aggregation, not be parsed as a brand-new "list tables" question.
+    second = client.post("/api/ask", json={"question": "BigQuery-GA", "dry_run": True, "session_id": "clarify-db"})
+
+    first_data = first.json()
+    assert first_data["query_result"]["status"] == "requires_clarification"
+    assert first_data["query_result"]["clarification_type"] == "database"
+    second_data = second.json()
+    assert second_data["query_plan"]["intent"] == "table_aggregation"
+    assert second_data["query_plan"]["table_name"] == "orders"
+    assert second_data["query_plan"]["relative_days"] == 7
+    assert second_data["query_plan"]["time_grain"] == "day"
+    assert second_data["query_result"]["status"] == "requires_approval"
+
+
+def test_ask_api_database_answer_with_chatty_suffix_still_resumes() -> None:
+    client = TestClient(create_app())
+
+    client.post("/api/ask", json={"question": "orders 这个表最近7天的每天的数据count", "dry_run": True, "session_id": "clarify-db-2"})
+    second = client.post("/api/ask", json={"question": "BigQuery-GA 中的，你在上文的输出中没有获取到吗", "dry_run": True, "session_id": "clarify-db-2"})
+
+    data = second.json()
+    assert data["query_plan"]["intent"] == "table_aggregation"
+    assert data["query_plan"]["table_name"] == "orders"
+    assert data["query_result"]["status"] == "requires_approval"
+
+
+def test_ask_api_new_question_mentioning_database_is_not_hijacked() -> None:
+    client = TestClient(create_app())
+
+    client.post("/api/ask", json={"question": "orders 这个表最近7天的每天的数据count", "dry_run": True, "session_id": "clarify-db-3"})
+    # This mentions the database but is clearly its own request — it must NOT
+    # be rewritten back into the pending orders aggregation.
+    second = client.post("/api/ask", json={"question": "BigQuery-GA 下有哪些表", "dry_run": True, "session_id": "clarify-db-3"})
+
+    data = second.json()
+    assert data["query_plan"].get("table_name") != "orders"
+    assert data["query_plan"]["intent"] != "table_aggregation"
