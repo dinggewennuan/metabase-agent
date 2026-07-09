@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 from typing import Any
 
 from metabase_agent.config.settings import Settings
@@ -28,6 +30,8 @@ from metabase_agent.memory.vector import (
     SiliconFlowEmbeddingProvider,
     VectorIndex,
 )
+
+_LOGGER = logging.getLogger("metabase_agent")
 
 
 class MemoryManager:
@@ -135,8 +139,7 @@ class MemoryManager:
         record.updated_at = now
         record.last_seen = now
         self.repository.put(record)
-        if record.memory_type in {MemoryType.SEMANTIC, MemoryType.EPISODIC}:
-            self.vector_index.upsert(record, self.embedding_provider.embed(record.content))
+        self._sync_vector(record)
         return record
 
     def _upsert_candidate(self, *, tenant_id: str, user_id: str, candidate: CandidateMemory) -> MemoryRecord | None:
@@ -174,9 +177,24 @@ class MemoryManager:
                 last_seen=now,
             )
         self.repository.put(record)
-        if record.status == MemoryStatus.ACTIVE and record.memory_type in {MemoryType.SEMANTIC, MemoryType.EPISODIC}:
-            self.vector_index.upsert(record, self.embedding_provider.embed(record.content))
+        self._sync_vector(record)
         return record
+
+    def _sync_vector(self, record: MemoryRecord) -> None:
+        """Mirror the record into the vector index (MongoDB stays the source of truth).
+
+        Synced for every status, not only ACTIVE — otherwise a record demoted to
+        pending/deleted keeps its stale 'active' row in pgvector and continues to
+        occupy search result slots. Failures are logged and swallowed so one bad
+        embed doesn't abort the surrounding candidate batch; the record remains
+        readable by key lookup.
+        """
+        if record.memory_type not in {MemoryType.SEMANTIC, MemoryType.EPISODIC}:
+            return
+        try:
+            self.vector_index.upsert(record, self.embedding_provider.embed(record.content))
+        except Exception:
+            _LOGGER.warning("memory.vector.upsert failed for %s; searchable by key only until backfilled", record.id, exc_info=True)
 
     def _extract_candidates(
         self,
@@ -246,7 +264,10 @@ class MemoryManager:
         return f"{prefix}.{_hash_text(candidate.content)[:16]}"
 
     def _record_id(self, namespace: tuple[str, ...], key: str) -> str:
-        return _hash_text("/".join(namespace) + ":" + key)
+        # Structured serialization: "/".join would let attacker-chosen
+        # tenant_id/user_id containing "/" collide across tenants and hijack
+        # each other's pgvector rows via ON CONFLICT (id).
+        return _hash_text(json.dumps([*namespace, key], ensure_ascii=False))
 
 
 def build_memory_manager(settings: Settings) -> MemoryManager:

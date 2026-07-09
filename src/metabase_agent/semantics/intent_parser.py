@@ -38,8 +38,6 @@ class ParsedIntent(TypedDict):
 
 
 def parse_intent(question: str) -> ParsedIntent:
-    trend_words = ("trend", "趋势", "变化", "按天", "daily", "weekly", "monthly")
-    comparison_words = ("compare", "对比", "比较", "vs", "同比", "环比")
     database_name = extract_database_name(question)
     schema_name = extract_schema_name(question, database_name)
     table_name = extract_table_name(question)
@@ -67,9 +65,9 @@ def parse_intent(question: str) -> ParsedIntent:
         parsed_intent = "database_list"
     elif "数据库" in question and any(word in question for word in ("多少", "几个", "数量")):
         parsed_intent = "database_count"
-    elif any(word in question.lower() or word in question for word in comparison_words):
+    elif _matches_markers(question, ("对比", "比较", "同比", "环比"), ("compare", "vs")):
         parsed_intent = "comparison"
-    elif any(word in question.lower() or word in question for word in trend_words):
+    elif _matches_markers(question, ("趋势", "变化", "按天"), ("trend", "daily", "weekly", "monthly")):
         parsed_intent = "metric_trend"
     else:
         parsed_intent = "metric_value"
@@ -122,7 +120,10 @@ def _matches_markers(question: str, cjk: tuple[str, ...], latin: tuple[str, ...]
     if any(word in question for word in cjk):
         return True
     lowered = question.lower()
-    return any(re.search(rf"\b{word}\b", lowered) for word in latin)
+    # Explicit ASCII boundaries instead of \b: Python counts CJK as \w, so
+    # \bcount\b would miss "数据count"; and plain substring matching would fire
+    # inside identifiers ("accounts", "summary", TIMESTAMP_TRUNC's "run").
+    return any(re.search(rf"(?<![A-Za-z0-9_]){re.escape(word)}(?![A-Za-z0-9_])", lowered) for word in latin)
 
 
 def is_sql_explanation_request(question: str) -> bool:
@@ -184,16 +185,18 @@ def _normalize_extracted_table_name(value: str) -> str:
 
 
 def extract_aggregation_function(question: str) -> str | None:
-    lowered = question.lower()
-    if any(word in lowered or word in question for word in ("count", "多少条", "多少行", "记录数", "行数", "条数")):
+    # Latin keywords need word boundaries: "accounts"/"discount" contain
+    # "count" and "summary" contains "sum" — substring matching turned a
+    # field-list question into an aggregation.
+    if _matches_markers(question, ("多少条", "多少行", "记录数", "行数", "条数"), ("count",)):
         return "count"
-    if any(word in lowered or word in question for word in ("sum", "求和", "总和", "合计")):
+    if _matches_markers(question, ("求和", "总和", "合计"), ("sum",)):
         return "sum"
-    if any(word in lowered or word in question for word in ("avg", "average", "平均")):
+    if _matches_markers(question, ("平均",), ("avg", "average")):
         return "avg"
-    if any(word in lowered or word in question for word in ("max", "最大")):
+    if _matches_markers(question, ("最大",), ("max",)):
         return "max"
-    if any(word in lowered or word in question for word in ("min", "最小")):
+    if _matches_markers(question, ("最小",), ("min",)):
         return "min"
     return None
 
@@ -229,11 +232,10 @@ def extract_relative_days(question: str) -> int | None:
 
 
 def extract_time_grain(question: str) -> str | None:
-    lowered = question.lower()
-    if any(word in question or word in lowered for word in ("每天", "按天", "daily", "day")):
+    if _matches_markers(question, ("每天", "按天"), ("daily", "day")):
         return "day"
-    if any(word in question or word in lowered for word in ("每周", "按周", "weekly", "week")):
+    if _matches_markers(question, ("每周", "按周"), ("weekly", "week")):
         return "week"
-    if any(word in question or word in lowered for word in ("每月", "按月", "monthly", "month")):
+    if _matches_markers(question, ("每月", "按月"), ("monthly", "month")):
         return "month"
     return None

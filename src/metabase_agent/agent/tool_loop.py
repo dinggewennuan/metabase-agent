@@ -29,6 +29,7 @@ class LoopOutcome:
     trace: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
     pending_sql: str | None = None
+    pending_database_name: str | None = None
     pending_tool_call_id: str | None = None
     last_result: dict[str, Any] | None = None
 
@@ -58,6 +59,7 @@ def run_tool_loop(
     *,
     max_iterations: int = 6,
     approved_sql: str | None = None,
+    approved_database_name: str | None = None,
     approved_tool_call_id: str | None = None,
     memory_context: str = "",
     skills_context: str = "",
@@ -70,6 +72,7 @@ def run_tool_loop(
         tools,
         max_iterations=max_iterations,
         approved_sql=approved_sql,
+        approved_database_name=approved_database_name,
         approved_tool_call_id=approved_tool_call_id,
         memory_context=memory_context,
         skills_context=skills_context,
@@ -87,6 +90,7 @@ def iter_tool_loop(
     *,
     max_iterations: int = 6,
     approved_sql: str | None = None,
+    approved_database_name: str | None = None,
     approved_tool_call_id: str | None = None,
     memory_context: str = "",
     skills_context: str = "",
@@ -96,7 +100,10 @@ def iter_tool_loop(
     seen_calls: set[str] = set()
     if approved_sql is not None:
         messages = list(history)
-        last_result = tools.dispatch("run_sql", {"sql": approved_sql})
+        run_sql_arguments: dict[str, Any] = {"sql": approved_sql}
+        if approved_database_name:
+            run_sql_arguments["database_name"] = approved_database_name
+        last_result = tools.dispatch("run_sql", run_sql_arguments)
         trace: list[dict[str, Any]] = [{"step": "tool.result", "tool": "run_sql", "status": last_result.get("status"), "approved": True}]
         messages.append(_tool_result_message(approved_tool_call_id or "run_sql", "run_sql", last_result))
     else:
@@ -111,18 +118,24 @@ def iter_tool_loop(
             return
 
         messages.append({"role": "assistant", "content": "", "tool_calls": [_serialize_call(call) for call in reply]})
-        for call in reply:
+        for index, call in enumerate(reply):
             call_event = {"step": "tool.call", "tool": call.name, "arguments": call.arguments}
             trace.append(call_event)
             yield "trace", call_event
             if call.name == "run_sql":
                 sql = str(call.arguments.get("sql") or "")
+                # Every tool_call in this batch except run_sql itself needs a
+                # response message, or the resumed conversation is rejected by
+                # the API for having unanswered tool calls.
+                for deferred in reply[index + 1 :]:
+                    messages.append(_tool_result_message(deferred.id, deferred.name, {"status": "deferred", "error": "deferred until pending SQL approval is resolved; call again if still needed"}))
                 yield "outcome", LoopOutcome(
                     status="requires_approval",
                     answer="请先 review 这条 SQL，确认后授权执行，或拒绝本次执行。",
                     trace=trace,
                     messages=messages,
                     pending_sql=sql,
+                    pending_database_name=str(call.arguments.get("database_name") or "") or None,
                     pending_tool_call_id=call.id,
                 )
                 return

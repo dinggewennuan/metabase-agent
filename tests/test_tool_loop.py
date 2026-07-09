@@ -356,3 +356,83 @@ def test_iter_tool_loop_streams_events_then_outcome() -> None:
     assert kinds[-1] == "outcome"
     assert isinstance(events[-1][1], LoopOutcome)
     assert events[-1][1].answer == "有 3 个库。"
+
+
+def test_loop_suspends_with_database_name_and_defers_parallel_calls() -> None:
+    transport = _ScriptedTransport(
+        [
+            [
+                ToolCall(id="c1", name="run_sql", arguments={"sql": "SELECT 1", "database_name": "warehouse"}),
+                ToolCall(id="c2", name="list_databases", arguments={}),
+            ],
+        ]
+    )
+
+    outcome = run_tool_loop("跑一下", [], transport, _tools())
+
+    assert outcome.status == "requires_approval"
+    assert outcome.pending_database_name == "warehouse"
+    # Every tool_call in the suspended batch (except run_sql itself) must have
+    # a response message, or the resumed conversation is rejected by the API.
+    tool_messages = [message for message in outcome.messages if message.get("role") == "tool"]
+    assert any(message["tool_call_id"] == "c2" for message in tool_messages)
+
+
+def test_loop_resume_executes_approved_sql_on_approved_database() -> None:
+    captured: dict[str, Any] = {}
+
+    class _StubClient:
+        def list_databases(self) -> Any:
+            return {"data": [{"id": 7, "name": "warehouse"}, {"id": 19, "name": "BigQuery-GA"}]}
+
+        def execute_native_query(self, database_id: int, sql: str) -> dict[str, Any]:
+            captured["database_id"] = database_id
+            return {"status": "completed", "row_count": 0, "data": {"cols": [], "rows": []}}
+
+    tools = AgentTools(Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="k", METABASE_BIGQUERY_DATABASE_ID=19), dry_run=False)
+    tools._client = _StubClient()  # type: ignore[assignment]
+    transport = _ScriptedTransport(["已执行。"])
+
+    outcome = run_tool_loop(
+        "",
+        [{"role": "user", "content": "q"}, {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "run_sql", "arguments": {"sql": "SELECT 1", "database_name": "warehouse"}}]}],
+        transport,
+        tools,
+        approved_sql="SELECT 1",
+        approved_database_name="warehouse",
+        approved_tool_call_id="c1",
+    )
+
+    assert outcome.status == "completed"
+    # The approved SQL must run on the database the user reviewed, not the default.
+    assert captured["database_id"] == 7
+
+
+def test_run_sql_rejects_unknown_database_instead_of_falling_back() -> None:
+    class _StubClient:
+        def list_databases(self) -> Any:
+            return {"data": [{"id": 19, "name": "BigQuery-GA"}]}
+
+        def execute_native_query(self, database_id: int, sql: str) -> dict[str, Any]:  # pragma: no cover
+            raise AssertionError("must not execute against a fallback database")
+
+    tools = AgentTools(Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="k"), dry_run=False)
+    tools._client = _StubClient()  # type: ignore[assignment]
+
+    result = tools.dispatch("run_sql", {"sql": "SELECT 1", "database_name": "no-such-db"})
+
+    assert result["status"] == "not_found"
+
+
+def test_dispatch_turns_network_errors_into_tool_failures() -> None:
+    class _StubClient:
+        def list_databases(self) -> Any:
+            raise httpx.ConnectError("boom")
+
+    tools = AgentTools(Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="k"), dry_run=False)
+    tools._client = _StubClient()  # type: ignore[assignment]
+
+    result = tools.dispatch("list_databases", {})
+
+    assert result["status"] == "failed"
+    assert "ConnectError" in result["error"]

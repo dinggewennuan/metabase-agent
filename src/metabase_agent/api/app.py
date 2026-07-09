@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from metabase_agent.agent.graph import build_graph
+from metabase_agent.agent.sql_review import program_fingerprint
 from metabase_agent.agent.tool_loop import LoopOutcome, iter_tool_loop
 from metabase_agent.agent.tools import AgentTools
 from metabase_agent.api.store import SqliteStore
@@ -77,8 +79,23 @@ def _pop_approval(session_id: str) -> None:
     if store is not None:
         store.pop_approval(session_id)
         return
-    PENDING_SQL_APPROVALS.pop(session_id, None)
-    _save_state()
+    with _STATE_LOCK:
+        PENDING_SQL_APPROVALS.pop(session_id, None)
+        _save_state()
+
+
+def _claim_approval(session_id: str) -> dict[str, Any] | None:
+    """Atomically consume the pending approval — take-once, so two concurrent
+    approve requests cannot both execute the same SQL."""
+    store = _active_store()
+    if store is not None:
+        return store.claim_approval(session_id)
+    _load_state()
+    with _STATE_LOCK:
+        data = PENDING_SQL_APPROVALS.pop(session_id, None)
+        if data is not None:
+            _save_state()
+    return data
 
 
 def _get_table_context(session_id: str) -> dict[str, Any] | None:
@@ -204,9 +221,11 @@ def _load_state() -> None:
 
 
 def _save_state() -> None:
+    # Serialize AND write inside the lock: writing outside lets an older
+    # snapshot land on disk after a newer one (last os.replace wins).
     with _STATE_LOCK:
         payload = json.dumps({"approvals": PENDING_SQL_APPROVALS, "table_context": PENDING_TABLE_CONTEXT}, ensure_ascii=False, indent=2)
-    _atomic_write(_state_path(), payload)
+        _atomic_write(_state_path(), payload)
 
 
 def _load_memory() -> None:
@@ -233,9 +252,10 @@ def _load_memory() -> None:
 def _save_memory() -> None:
     # Atomic write: a concurrent reader (or another process) always sees the
     # complete previous or complete new file, never a half-written one.
+    # Kept inside the lock so on-disk write order matches snapshot order.
     with _STATE_LOCK:
         payload = json.dumps(CONVERSATION_MEMORY, ensure_ascii=False, indent=2)
-    _atomic_write(_memory_path(), payload)
+        _atomic_write(_memory_path(), payload)
 
 
 def _is_memory_message(value: object) -> bool:
@@ -282,8 +302,10 @@ def _answer_from_memory(question: str, history: list[dict[str, str]]) -> str | N
     return f"你上次问的是：{last_question}"
 
 
-_APPROVAL_PHRASES = ("确认执行", "同意执行", "可以执行", "执行吧", "批准执行", "approve", "run it", "execute")
-_REJECTION_PHRASES = ("拒绝", "取消", "不要执行", "不执行", "reject", "cancel")
+# Bare verbs like "execute"/"run it" are deliberately NOT approval phrases:
+# they appear inside negations ("please don't execute") and would fire there.
+_APPROVAL_PHRASES = ("确认执行", "同意执行", "可以执行", "执行吧", "批准执行", "approve")
+_REJECTION_PHRASES = ("拒绝", "取消", "不要执行", "不执行", "不用执行", "别执行", "reject", "cancel", "don't execute", "do not execute", "don't run", "do not run")
 
 
 def _is_sql_approval(question: str, decision: str | None = None) -> bool:
@@ -355,6 +377,7 @@ class _PreparedAsk:
     user_id: str
     memory_context: str = ""
     skills_context: str = ""
+    approved: dict[str, Any] | None = None
 
 
 def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk | None]:
@@ -364,10 +387,10 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
     pending_sql = _get_approval(payload.session_id)
     question = payload.question
     sql_approved = False
-    if pending_sql and _is_sql_approval(question, payload.decision):
-        question = str(pending_sql["question"])
-        sql_approved = True
-    elif pending_sql and _is_sql_rejection(question, payload.decision):
+    approved: dict[str, Any] | None = None
+    # Rejection is checked BEFORE approval: "do not execute" must never be
+    # read as an approval just because it mentions execution.
+    if pending_sql and _is_sql_rejection(question, payload.decision):
         _pop_approval(payload.session_id)
         answer = "已拒绝执行，SQL 未运行。"
         _remember(payload.session_id, "user", "拒绝执行")
@@ -381,6 +404,22 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
             session_id=payload.session_id,
             memory=memory,
         ), None
+    elif pending_sql and _is_sql_approval(question, payload.decision):
+        approved = _claim_approval(payload.session_id)
+        if approved is None:
+            answer = "当前没有待审批的 SQL（可能已被其他请求处理）。"
+            memory = _remember(payload.session_id, "assistant", answer)
+            return AskResponse(
+                answer=answer,
+                query_plan={"intent": "sql_approval", "already_consumed": True},
+                program=None,
+                query_result={"status": "not_found"},
+                trace=[{"step": "sql.review", "status": "already_consumed"}],
+                session_id=payload.session_id,
+                memory=memory,
+            ), None
+        question = str(approved.get("question") or question)
+        sql_approved = True
     else:
         question = _fill_table_follow_up(question, _get_table_context(payload.session_id))
     memory_answer = None if _use_tools(settings, dry_run) else _answer_from_memory(payload.question, history)
@@ -405,18 +444,24 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
         user_id=user_id,
         memory_context=memory_context,
         skills_context=skills_context,
+        approved=approved,
     )
 
 
 def _failed_ask(payload: AskRequest, exc: Exception) -> AskResponse:
+    # Exception text from HTTP/DB clients can carry internal URLs, hosts or
+    # request details — log it server-side, return only the exception class.
+    _LOGGER.exception("api.ask failed", exc_info=exc)
+    reason = type(exc).__name__
+    answer = f"查询失败（{reason}），详细原因已记录到服务端日志。"
     _remember(payload.session_id, "user", payload.question)
-    memory = _remember(payload.session_id, "assistant", f"查询失败：{exc}")
+    memory = _remember(payload.session_id, "assistant", answer)
     return AskResponse(
-        answer=f"查询失败：{exc}",
+        answer=answer,
         query_plan=None,
         program=None,
-        query_result={"status": "failed", "error": str(exc)},
-        trace=[{"step": "api.ask", "status": "failed", "error": str(exc)}],
+        query_result={"status": "failed", "error": reason},
+        trace=[{"step": "api.ask", "status": "failed", "error": reason}],
         session_id=payload.session_id,
         memory=memory,
     )
@@ -426,18 +471,24 @@ def _finalize_ask(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any]
     answer = str(result.get("answer", ""))
     query_result = result.get("query_result")
     if isinstance(query_result, dict) and query_result.get("status") == "requires_approval":
-        _set_approval(payload.session_id, {"question": run.question, "sql": query_result.get("sql")})
-    elif run.sql_approved:
-        _pop_approval(payload.session_id)
+        # Bind the approval to the exact reviewed content: the program
+        # fingerprint is re-checked before execution on the approved re-run.
+        _set_approval(
+            payload.session_id,
+            {
+                "question": run.question,
+                "sql": query_result.get("sql"),
+                "program_hash": program_fingerprint(result.get("program")),
+            },
+        )
     if isinstance(query_result, dict):
         query_plan = result.get("query_plan")
         suggestions = query_result.get("suggestions")
-        candidate_tables = query_result.get("candidate_tables")
         selected_table = None
         selected_schema = query_result.get("schema_name")
-        if isinstance(candidate_tables, list) and candidate_tables:
-            selected_table = candidate_tables[0]
-        elif isinstance(query_result.get("table_name"), str) and query_result.get("status") == "completed":
+        # Only a COMPLETED query fixes the follow-up table context; candidate
+        # tables from a clarification are suggestions the user never confirmed.
+        if isinstance(query_result.get("table_name"), str) and query_result.get("status") == "completed":
             selected_table = query_result["table_name"]
         elif isinstance(query_plan, dict) and isinstance(query_plan.get("table_name"), str) and query_result.get("status") == "completed":
             selected_table = query_plan["table_name"]
@@ -587,6 +638,19 @@ def _record_long_term_memory(payload: AskRequest, run: _PreparedAsk, result: dic
         _LOGGER.warning("memory.record_interaction failed: %s", exc)
 
 
+def _graph_input(run: _PreparedAsk) -> dict[str, Any]:
+    return {
+        "question": run.question,
+        "dry_run": run.dry_run,
+        "sql_approved": run.sql_approved,
+        "approved_program_hash": (run.approved or {}).get("program_hash"),
+        "tenant_id": run.tenant_id,
+        "user_id": run.user_id,
+        "memory_context": run.memory_context,
+        "skills_context": run.skills_context,
+    }
+
+
 def _run_ask(payload: AskRequest) -> AskResponse:
     early, run = _prepare_ask(payload)
     if early is not None or run is None:
@@ -595,15 +659,7 @@ def _run_ask(payload: AskRequest) -> AskResponse:
     if _use_tools(settings, run.dry_run):
         return _run_ask_tools(payload, run, settings)
     graph = _get_graph(settings)
-    graph_input = {
-        "question": run.question,
-        "dry_run": run.dry_run,
-        "sql_approved": run.sql_approved,
-        "tenant_id": run.tenant_id,
-        "user_id": run.user_id,
-        "memory_context": run.memory_context,
-        "skills_context": run.skills_context,
-    }
+    graph_input = _graph_input(run)
     graph_config = _graph_config(settings, payload.session_id)
     try:
         result = graph.invoke(graph_input, config=graph_config) if graph_config is not None else graph.invoke(graph_input)
@@ -616,7 +672,9 @@ _TOOL_STEP_LABELS = {"tool.call": "调用工具", "tool.result": "工具返回",
 
 
 def _tool_iterator(payload: AskRequest, run: _PreparedAsk, tools: AgentTools, transport: Any) -> Any:
-    pending = _get_approval(payload.session_id)
+    # run.approved is the atomically claimed pending approval; re-reading the
+    # store here would reopen the double-execution window.
+    pending = run.approved
     if run.sql_approved and isinstance(pending, dict) and pending.get("mode") == "tools":
         return iter_tool_loop(
             "",
@@ -624,6 +682,7 @@ def _tool_iterator(payload: AskRequest, run: _PreparedAsk, tools: AgentTools, tr
             transport,
             tools,
             approved_sql=str(pending.get("sql") or ""),
+            approved_database_name=str(pending.get("database_name") or "") or None,
             approved_tool_call_id=str(pending.get("tool_call_id") or ""),
             memory_context=run.memory_context,
             skills_context=run.skills_context,
@@ -633,8 +692,18 @@ def _tool_iterator(payload: AskRequest, run: _PreparedAsk, tools: AgentTools, tr
 
 def _finalize_tool_outcome(payload: AskRequest, run: _PreparedAsk, outcome: LoopOutcome) -> AskResponse:
     if outcome.status == "requires_approval":
-        _set_approval(payload.session_id, {"question": run.question, "sql": outcome.pending_sql, "messages": outcome.messages, "tool_call_id": outcome.pending_tool_call_id, "mode": "tools"})
-        query_result: dict[str, Any] = {"status": "requires_approval", "sql": outcome.pending_sql}
+        _set_approval(
+            payload.session_id,
+            {
+                "question": run.question,
+                "sql": outcome.pending_sql,
+                "database_name": outcome.pending_database_name,
+                "messages": outcome.messages,
+                "tool_call_id": outcome.pending_tool_call_id,
+                "mode": "tools",
+            },
+        )
+        query_result: dict[str, Any] = {"status": "requires_approval", "sql": outcome.pending_sql, "database_name": outcome.pending_database_name}
     else:
         _pop_approval(payload.session_id)
         query_result = outcome.last_result or {"status": outcome.status}
@@ -717,8 +786,10 @@ def _check_token(x_agent_token: str | None) -> None:
     settings = get_settings()
     token = settings.agent_api_token
     if settings.agent_require_token and not token:
-        raise HTTPException(status_code=401, detail="server requires AGENT_API_TOKEN but none is configured")
-    if token and x_agent_token != token:
+        # Don't leak server configuration state to unauthenticated callers.
+        _LOGGER.error("AGENT_REQUIRE_TOKEN is true but AGENT_API_TOKEN is not configured; rejecting request")
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if token and not secrets.compare_digest(x_agent_token or "", token):
         raise HTTPException(status_code=401, detail="invalid or missing X-Agent-Token")
 
 
@@ -848,15 +919,7 @@ def create_app() -> FastAPI:
                 return
             graph = _get_graph(settings)
             result: dict[str, Any] = {}
-            graph_input = {
-                "question": run.question,
-                "dry_run": run.dry_run,
-                "sql_approved": run.sql_approved,
-                "tenant_id": run.tenant_id,
-                "user_id": run.user_id,
-                "memory_context": run.memory_context,
-                "skills_context": run.skills_context,
-            }
+            graph_input = _graph_input(run)
             graph_config = _graph_config(settings, payload.session_id)
             try:
                 stream = graph.stream(graph_input, config=graph_config, stream_mode="updates") if graph_config is not None else graph.stream(graph_input, stream_mode="updates")

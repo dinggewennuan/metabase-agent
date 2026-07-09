@@ -102,3 +102,27 @@ def test_read_only_sql_blocks_bigquery_scripting_and_export() -> None:
     assert is_read_only_sql("LOAD DATA INTO t FROM FILES(uris=['gs://x'])") is False
     assert is_read_only_sql("SELECT 1; EXECUTE IMMEDIATE 'DROP TABLE users'") is False
     assert is_read_only_sql("WITH x AS (SELECT 1) SELECT * FROM x; CALL p()") is False
+
+
+def test_extract_native_sql_keeps_chinese_comment_and_following_lines() -> None:
+    # A Chinese comment must not truncate the SQL: the mutilated statement
+    # (WHERE/LIMIT dropped) would still pass the read-only check and run a
+    # different query than the one the user approved.
+    sql = "SELECT count(*) FROM `business_data.orders`\n-- 只看最近7天\nWHERE created_at > '2026-01-01'\nLIMIT 10"
+
+    extracted = extract_native_sql(sql)
+
+    assert extracted is not None
+    assert "只看最近7天" in extracted
+    assert "WHERE created_at > '2026-01-01'" in extracted
+    assert "LIMIT 10" in extracted
+
+
+def test_extract_native_sql_keeps_chinese_string_literal() -> None:
+    assert extract_native_sql("SELECT * FROM t WHERE city = '北京' LIMIT 5") == "SELECT * FROM t WHERE city = '北京' LIMIT 5"
+
+
+def test_extract_native_sql_still_strips_prose_after_chinese_literal() -> None:
+    extracted = extract_native_sql("SELECT * FROM t WHERE city = '北京' LIMIT 5 帮我看看这个结果")
+
+    assert extracted == "SELECT * FROM t WHERE city = '北京' LIMIT 5"

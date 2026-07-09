@@ -50,7 +50,7 @@ class OpenAIEmbeddingProvider:
         if self._dimensions > 0:
             kwargs["dimensions"] = self._dimensions
         response = self._client.embeddings.create(**kwargs)
-        return list(response.data[0].embedding)
+        return _check_dimensions(list(response.data[0].embedding), self._dimensions)
 
 
 class SiliconFlowEmbeddingProvider:
@@ -61,6 +61,7 @@ class SiliconFlowEmbeddingProvider:
         self._base_url = settings.siliconflow_base_url.rstrip("/")
         self._model = settings.agent_embedding_model
         self._timeout = settings.openai_timeout
+        self._dimensions = settings.agent_embedding_dimensions
 
     def embed(self, text: str) -> list[float]:
         response = httpx.post(
@@ -80,7 +81,7 @@ class SiliconFlowEmbeddingProvider:
         first = data[0]
         if not isinstance(first, dict) or not isinstance(first.get("embedding"), list):
             raise RuntimeError("invalid SiliconFlow embedding response")
-        return [float(value) for value in first["embedding"]]
+        return _check_dimensions([float(value) for value in first["embedding"]], self._dimensions)
 
 
 class VectorIndex(Protocol):
@@ -181,6 +182,18 @@ class PgVectorIndex:
         with self._psycopg.connect(self._dsn) as conn:
             rows = conn.execute(sql, params).fetchall()
         return [str(row[0]) for row in rows]
+
+
+def _check_dimensions(embedding: list[float], expected: int) -> list[float]:
+    # Fail loudly here: a mismatched vector would otherwise be rejected by the
+    # pgvector table on every upsert and silently disable semantic recall.
+    if expected > 0 and len(embedding) != expected:
+        raise RuntimeError(
+            f"embedding dimension mismatch: provider returned {len(embedding)} dims but "
+            f"AGENT_EMBEDDING_DIMENSIONS={expected}; the pgvector table must use the same dimension "
+            f"(e.g. BAAI/bge-m3 needs AGENT_EMBEDDING_DIMENSIONS=1024)"
+        )
+    return embedding
 
 
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:

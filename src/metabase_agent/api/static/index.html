@@ -322,7 +322,7 @@
       trace.forEach((item, index) => {
         const node = document.createElement('div');
         node.className = 'step';
-        node.innerHTML = `<strong>${index + 1}. ${item.step || 'step'}</strong><br>${escapeHtml(JSON.stringify(item))}`;
+        node.innerHTML = `<strong>${index + 1}. ${escapeHtml(String(item.step || 'step'))}</strong><br>${escapeHtml(JSON.stringify(item))}`;
         steps.appendChild(node);
         const processNode = document.createElement('div');
         processNode.className = 'process-item';
@@ -475,11 +475,20 @@
       }
     }
     async function runApproval(action, actions) {
-      actions.querySelectorAll('button').forEach(node => { node.disabled = true; });
+      // Disable EVERY approval button on the page, not only the current bubble:
+      // a double-click (or an older bubble's button) must not fire a second
+      // approve request against the same pending SQL.
+      const buttons = Array.from(document.querySelectorAll('.approval-actions button'));
+      buttons.forEach(node => { node.disabled = true; });
       const approve = action === 'approve';
       const turn = addBubble('agent', approve ? '已授权，正在执行 SQL...' : '正在拒绝本次执行...');
       status.textContent = approve ? '执行中...' : '拒绝中...';
-      await askStream({question: approve ? '确认执行' : '拒绝执行', decision: action, dry_run: document.getElementById('dryRun').checked, session_id: currentSessionId()}, turn);
+      try {
+        await askStream({question: approve ? '确认执行' : '拒绝执行', decision: action, dry_run: document.getElementById('dryRun').checked, session_id: currentSessionId()}, turn);
+      } catch (error) {
+        status.textContent = `请求失败：${error}`;
+        buttons.forEach(node => { node.disabled = false; });
+      }
     }
     function setResultActionsEnabled(enabled) {
       copyResult.disabled = !enabled;
@@ -540,19 +549,27 @@
       return String(value);
     }
     function escapeHtml(text) {
-      return text.replace(/[&<>"]/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[char]));
+      return String(text).replace(/[&<>"']/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char]));
     }
-    fetch('/api/config').then(res => res.json()).then(data => {
+    fetch('/api/config').then(res => res.ok ? res.json() : {}).then(data => {
       document.getElementById('dryRun').checked = Boolean(data.default_dry_run);
-    });
+    }).catch(() => {});
     async function loadHistory() {
       const sessionId = currentSessionId();
       localStorage.setItem(storageKey, sessionId);
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {headers: authHeaders({})});
-      const data = await res.json();
-      renderMemory(data.memory, data.pending_approval);
-      sessionPill.textContent = `session: ${sessionId}`;
-      status.textContent = `已加载 session ${sessionId}`;
+      try {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {headers: authHeaders({})});
+        if (!res.ok) {
+          status.textContent = `加载 session 失败（HTTP ${res.status}）`;
+          return;
+        }
+        const data = await res.json();
+        renderMemory(data.memory || [], data.pending_approval);
+        sessionPill.textContent = `session: ${sessionId}`;
+        status.textContent = `已加载 session ${sessionId}`;
+      } catch (error) {
+        status.textContent = `加载 session 失败：${error}`;
+      }
     }
     loadSession.addEventListener('click', loadHistory);
     sessionInput.addEventListener('change', loadHistory);

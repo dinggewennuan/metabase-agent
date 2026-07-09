@@ -1,3 +1,5 @@
+import pytest
+
 from metabase_agent.config.settings import Settings
 from metabase_agent.memory.manager import MemoryManager
 from metabase_agent.memory.models import MemoryRecord, MemoryStatus, MemoryType
@@ -113,6 +115,7 @@ def test_siliconflow_embedding_provider_uses_configured_api(monkeypatch) -> None
         Settings(
             SILICONFLOW_API_KEY="test-key",
             AGENT_EMBEDDING_MODEL="BAAI/bge-m3",
+            AGENT_EMBEDDING_DIMENSIONS=3,
             OPENAI_TIMEOUT=12,
         )
     )
@@ -124,3 +127,26 @@ def test_siliconflow_embedding_provider_uses_configured_api(monkeypatch) -> None
     assert captured["headers"] == {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
     assert captured["json"] == {"input": "Hello, world!", "model": "BAAI/bge-m3"}
     assert captured["timeout"] == 12
+
+
+def test_siliconflow_embedding_provider_rejects_dimension_mismatch(monkeypatch) -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    monkeypatch.setattr("metabase_agent.memory.vector.httpx.post", lambda *args, **kwargs: Response())
+    provider = SiliconFlowEmbeddingProvider(
+        Settings(
+            SILICONFLOW_API_KEY="test-key",
+            AGENT_EMBEDDING_MODEL="BAAI/bge-m3",
+            AGENT_EMBEDDING_DIMENSIONS=1536,
+        )
+    )
+
+    # A silent mismatch would be rejected by the pgvector table on every
+    # upsert and quietly disable semantic recall — it must fail loudly.
+    with pytest.raises(RuntimeError, match="dimension mismatch"):
+        provider.embed("Hello, world!")

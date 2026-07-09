@@ -13,10 +13,12 @@ from metabase_agent.agent.dry_run import (
 )
 from metabase_agent.agent.metadata_flow import run_database_metadata
 from metabase_agent.agent.sql_review import (
+    _APPROVAL_MISMATCH_NOTE,
     _should_execute_generated_sql,
     _sql_explanation_response,
     _sql_review_response,
     _sql_review_with_optional_explanation,
+    approved_program_mismatch,
 )
 from metabase_agent.agent.state import AgentState
 from metabase_agent.agent.trace import append_trace as _append_trace
@@ -137,6 +139,10 @@ def build_graph(settings: Settings, checkpointer: Any | None = None):
         if program["execute"]:
             if not state.get("sql_approved"):
                 return _sql_review_response(sql, program, query_plan, trace)
+            if approved_program_mismatch(state, program):
+                response = _sql_review_response(sql, program, query_plan, trace)
+                response["answer"] = _APPROVAL_MISMATCH_NOTE + "\n\n" + str(response["answer"])
+                return response
             if not is_read_only_sql(sql):
                 return {
                     "answer": "已生成 BigQuery 月度 web/api 用量汇总 SQL，但执行前安全校验未通过：只允许执行只读 SELECT/WITH SQL。",
@@ -161,14 +167,14 @@ def build_graph(settings: Settings, checkpointer: Any | None = None):
                         "trace": _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": "POST /api/dataset", "status": "failed", "status_code": exc.response.status_code}),
                     }
             return {
-                "answer": f"已生成并执行 BigQuery 月度 web/api 用量汇总 SQL，返回 {query_result.get('row_count', 0) if isinstance(query_result, dict) else 0} 行。图片类单位为 count；可统计时长的项目单位为 seconds。",
+                "answer": f"已生成并执行 BigQuery 月度 web/api 用量汇总 SQL（统计区间 {report_range_start} ~ {report_range_end_exclusive}（不含），时区 {report_timezone}；如需其他区间请调整 AGENT_REPORT_RANGE_* 配置），返回 {query_result.get('row_count', 0) if isinstance(query_result, dict) else 0} 行。图片类单位为 count；可统计时长的项目单位为 seconds。",
                 "query_plan": query_plan,
                 "program": program,
                 "query_result": query_result,
                 "trace": trace,
             }
         return {
-            "answer": "已生成 BigQuery 月度 web/api 用量汇总 SQL。图片类单位为 count；可统计时长的项目单位为 seconds。",
+            "answer": f"已生成 BigQuery 月度 web/api 用量汇总 SQL（统计区间 {report_range_start} ~ {report_range_end_exclusive}（不含），时区 {report_timezone}；如需其他区间请调整 AGENT_REPORT_RANGE_* 配置）。图片类单位为 count；可统计时长的项目单位为 seconds。",
             "query_plan": query_plan,
             "program": program,
             "query_result": {"status": "completed", "unit_policy": {"seconds": "duration_seconds 可用", "count": "只有 generated_count 有意义，例如图片生成"}, "sql": sql},
@@ -206,6 +212,11 @@ def build_graph(settings: Settings, checkpointer: Any | None = None):
             query_plan = {"intent": "native_sql_query", "database_name": "BigQuery-GA", "database_id": bigquery_database_id}
             analysis = _summarize_sql(sql, bool(state.get("dry_run"))) if wants_sql_explanation(question) else None
             return _sql_review_with_optional_explanation(sql, program, query_plan, trace, analysis)
+        if approved_program_mismatch(state, program):
+            query_plan = {"intent": "native_sql_query", "database_name": "BigQuery-GA", "database_id": bigquery_database_id}
+            response = _sql_review_response(sql, program, query_plan, trace)
+            response["answer"] = _APPROVAL_MISMATCH_NOTE + "\n\n" + str(response["answer"])
+            return response
         if state.get("dry_run"):
             query_result = {"status": "completed", "row_count": 0, "data": {"cols": [], "rows": []}, "dry_run": True, "sql": sql}
         else:
@@ -269,16 +280,18 @@ def build_graph(settings: Settings, checkpointer: Any | None = None):
             return {"query_result": {"status": "blocked", "error": policy_result.get("reason")}}
         if state.get("dry_run"):
             return {"query_result": _dry_result()}
-        if not state.get("sql_approved"):
-            program = cast(dict[str, Any], state.get("program", {}))
+        program = cast(dict[str, Any], state.get("program", {}))
+        if not state.get("sql_approved") or approved_program_mismatch(state, program):
             query_plan = cast(dict[str, Any], state.get("query_plan", {}))
             prompt = "请先 review 这条 Metabase 结构化查询，确认无误后点击授权确认执行，或拒绝本次执行。"
+            if state.get("sql_approved"):
+                prompt = _APPROVAL_MISMATCH_NOTE + " " + prompt
             return {
                 "query_plan": {**query_plan, "requires_approval": True},
                 "program": {**program, "requires_approval": True},
                 "query_result": {"status": "requires_approval", "program": program, "approval_prompt": prompt},
             }
-        return {"query_result": client.query(cast(dict[str, Any], state.get("program", {})))}
+        return {"query_result": client.query(program)}
 
     def answer_node(state: AgentState) -> AgentState:
         query_plan = cast(dict[str, Any], state.get("query_plan", {}))

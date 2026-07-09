@@ -156,11 +156,23 @@ def _match_agent_field_id(agent_fields: list[dict[str, Any]], field: dict[str, A
 
 
 def _first_numeric_field(fields: list[dict[str, Any]]) -> dict[str, Any] | None:
+    # Keys are excluded: the first numeric column of a real table is usually
+    # the `id` primary key, and sum(id)/avg(id) is a meaningless answer.
     for field in fields:
+        if _is_key_field(field):
+            continue
         field_type = str(field.get("effective_type") or field.get("base_type") or "").lower()
         if "integer" in field_type or "float" in field_type or "decimal" in field_type or "number" in field_type:
             return field
     return None
+
+
+def _is_key_field(field: dict[str, Any]) -> bool:
+    semantic_type = str(field.get("semantic_type") or "").lower()
+    if semantic_type.endswith("/pk") or semantic_type.endswith("/fk"):
+        return True
+    name = str(field.get("name") or field.get("display_name") or "").lower()
+    return name == "id" or name.endswith("_id")
 
 
 def _first_datetime_field(fields: list[dict[str, Any]]) -> dict[str, Any] | None:

@@ -18,6 +18,18 @@ from metabase_agent.tools.metabase.client import MetabaseClient
 
 app = typer.Typer(help="Metabase semantic analytics agent")
 
+# One MemoryManager (and its Mongo/PG connections) per CLI invocation instead
+# of one per call site.
+_MEMORY_MANAGER_CACHE: dict[str, Any] = {}
+
+
+def _cli_memory_manager(settings: Settings) -> Any:
+    manager = _MEMORY_MANAGER_CACHE.get("manager")
+    if manager is None:
+        manager = build_memory_manager(settings)
+        _MEMORY_MANAGER_CACHE["manager"] = manager
+    return manager
+
 
 @app.callback()
 def main() -> None:
@@ -40,8 +52,9 @@ def ask(question: str, dry_run: bool = typer.Option(False, help="Use determinist
         return
     graph = build_graph(settings)
     result = graph.invoke({"question": question, "dry_run": use_dry_run, "tenant_id": tenant_id, "user_id": user_id, "memory_context": memory_context, "skills_context": skills_context})
-    _record_cli_memory(settings, tenant_id, user_id, question, str(result.get("answer", "")), result)
-    typer.echo(result["answer"])
+    answer = str(result.get("answer", ""))
+    _record_cli_memory(settings, tenant_id, user_id, question, answer, result)
+    typer.echo(answer)
     typer.echo(json.dumps({"query_plan": result.get("query_plan"), "program": result.get("program")}, ensure_ascii=False, indent=2))
 
 
@@ -81,7 +94,7 @@ def _cli_contexts(settings: Settings, question: str) -> tuple[str, str, str, str
     memory_context = ""
     skills_context = ""
     try:
-        memory_context = build_memory_manager(settings).load_context(tenant_id=tenant_id, user_id=user_id, query=question).rendered
+        memory_context = _cli_memory_manager(settings).load_context(tenant_id=tenant_id, user_id=user_id, query=question).rendered
     except Exception as exc:
         logging.getLogger("metabase_agent").warning("memory.context.load failed: %s", exc)
     try:
@@ -97,7 +110,7 @@ def _record_cli_memory(settings: Settings, tenant_id: str, user_id: str, questio
     try:
         query_result = result.get("query_result")
         query_plan = result.get("query_plan")
-        build_memory_manager(settings).record_interaction(
+        _cli_memory_manager(settings).record_interaction(
             tenant_id=tenant_id,
             user_id=user_id,
             question=question,

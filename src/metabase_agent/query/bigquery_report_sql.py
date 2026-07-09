@@ -74,17 +74,16 @@ def _clean_sql(sql: str) -> str:
 
 
 def _truncate_sql_candidate(sql: str) -> str:
-    lines = sql.strip().splitlines()
-    cleaned_lines: list[str] = []
-    for line in lines:
-        cleaned_line = line.rstrip()
-        if _contains_cjk(cleaned_line):
-            cleaned_line = re.split(r"[\u4e00-\u9fff]", cleaned_line, maxsplit=1)[0].rstrip()
-            if cleaned_line:
-                cleaned_lines.append(cleaned_line)
-            break
-        cleaned_lines.append(cleaned_line)
-    return _trim_incomplete_sql_tail("\n".join(cleaned_lines).strip())
+    # CJK text marks where trailing natural language starts, but only OUTSIDE
+    # string literals, comments and backtick identifiers \u2014 otherwise a Chinese
+    # comment or literal would silently truncate the SQL (dropping WHERE/LIMIT)
+    # while the mutilated statement still passes the read-only check.
+    text = sql.strip()
+    masked = _mask_sql_literals_comments_and_identifiers(text)
+    match = re.search(r"[\u4e00-\u9fff]", masked)
+    if match:
+        text = text[: match.start()].rstrip()
+    return _trim_incomplete_sql_tail(text)
 
 
 def _remove_trailing_non_sql_text(sql: str) -> str:
@@ -155,10 +154,6 @@ def _quoted_end(sql: str, start: int, quote: str) -> int:
         index += 1
     return len(sql)
 
-
-
-def _contains_cjk(text: str) -> bool:
-    return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
 def _strip_leading_comments(sql: str) -> str:

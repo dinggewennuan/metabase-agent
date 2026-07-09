@@ -7,6 +7,15 @@ from typing import Protocol
 from metabase_agent.memory.models import MemoryRecord, MemoryStatus, utc_now_iso
 
 
+def namespace_path(namespace: tuple[str, ...]) -> str:
+    """Scalar, unambiguous form of a namespace tuple.
+
+    The unit separator cannot appear in identifiers, so ("t", "a/b") and
+    ("t/a", "b") never map to the same path the way "/".join would.
+    """
+    return "\x1f".join(namespace)
+
+
 class MemoryRepository(Protocol):
     def get_by_id(self, record_id: str) -> MemoryRecord | None: ...
 
@@ -124,7 +133,15 @@ class MongoMemoryRepository:
 
         self._client = MongoClient(uri)
         self._collection = self._client[database][collection]
-        self._collection.create_index([("namespace", ASCENDING), ("key", ASCENDING)], unique=True)
+        # The unique index is built on the SCALAR namespace_path, never on the
+        # namespace array: a unique index over an array field is multikey (one
+        # index entry per element), so two users sharing any element — e.g. the
+        # literal "tenant" prefix — would collide on the same key.
+        try:
+            self._collection.drop_index("namespace_1_key_1")
+        except Exception:
+            pass
+        self._collection.create_index([("namespace_path", ASCENDING), ("key", ASCENDING)], unique=True)
         self._collection.create_index([("id", ASCENDING)], unique=True)
         self._collection.create_index([("tenant_id", ASCENDING), ("user_id", ASCENDING), ("memory_type", ASCENDING), ("status", ASCENDING)])
 
@@ -133,16 +150,17 @@ class MongoMemoryRepository:
         return MemoryRecord.from_dict(payload) if payload else None
 
     def get(self, namespace: tuple[str, ...], key: str) -> MemoryRecord | None:
-        payload = self._collection.find_one({"namespace": list(namespace), "key": key})
+        payload = self._collection.find_one({"namespace_path": namespace_path(namespace), "key": key})
         return MemoryRecord.from_dict(payload) if payload else None
 
     def put(self, record: MemoryRecord) -> None:
         payload = record.to_dict()
+        payload["namespace_path"] = namespace_path(record.namespace)
         payload["updated_at"] = payload.get("updated_at") or utc_now_iso()
-        self._collection.replace_one({"namespace": payload["namespace"], "key": payload["key"]}, payload, upsert=True)
+        self._collection.replace_one({"namespace_path": payload["namespace_path"], "key": payload["key"]}, payload, upsert=True)
 
     def list_namespace(self, namespace: tuple[str, ...], *, status: MemoryStatus | None = None, limit: int = 50) -> list[MemoryRecord]:
-        query: dict[str, object] = {"namespace": list(namespace)}
+        query: dict[str, object] = {"namespace_path": namespace_path(namespace)}
         if status is not None:
             query["status"] = status.value
         cursor = self._collection.find(query).sort("updated_at", -1).limit(limit)

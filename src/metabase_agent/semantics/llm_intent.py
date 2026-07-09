@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from metabase_agent.config.settings import Settings
@@ -34,9 +35,14 @@ def _parse_json_content(content: str | None) -> dict[str, Any] | None:
     if not content:
         return None
     cleaned = content.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`").removeprefix("json").strip()
-    parsed = json.loads(cleaned)
+    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", cleaned, re.DOTALL)
+    if fenced:
+        cleaned = fenced.group(1)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Non-JSON model output degrades to "no LLM intent", never a crash.
+        return None
     if not isinstance(parsed, dict):
         return None
     return _normalize_intent(parsed)

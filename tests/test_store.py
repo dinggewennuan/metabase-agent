@@ -80,3 +80,16 @@ def test_purge_disabled_when_ttl_zero(tmp_path) -> None:
     store.purge_expired(ttl_seconds=0)
 
     assert store.get_approval("s1") == {"sql": "SELECT 1"}
+
+
+def test_claim_approval_is_take_once(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.set_approval("s1", {"sql": "SELECT 1", "mode": "tools"})
+
+    first = store.claim_approval("s1")
+    second = store.claim_approval("s1")
+
+    # Two concurrent approve requests must not both see the pending SQL.
+    assert first == {"sql": "SELECT 1", "mode": "tools"}
+    assert second is None
+    assert store.get_approval("s1") is None

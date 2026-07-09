@@ -15,5 +15,5 @@ description: Use this skill for SQL review, SQL approval, read-only policy, nati
 
 ## Approval language
 
-Treat explicit approval such as `确认执行`, `同意执行`, `approve`, or `execute` as approval only when the message does not contain a new SQL statement.
+Treat explicit approval such as `确认执行`, `同意执行`, or `approve` as approval only when the message does not contain a new SQL statement. Bare verbs like `execute` or `run it` are NOT approval — they also appear inside negations such as "do not execute". Rejection phrases (`拒绝`, `不要执行`, `reject`, `cancel`, `do not execute`) always take precedence over approval phrases.
 

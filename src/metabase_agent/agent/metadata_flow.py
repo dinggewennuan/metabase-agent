@@ -36,7 +36,12 @@ from metabase_agent.agent.metadata import (
     _table_items,
     _table_schema,
 )
-from metabase_agent.agent.sql_review import _sql_review_response, _table_sql_preview
+from metabase_agent.agent.sql_review import (
+    _APPROVAL_MISMATCH_NOTE,
+    _sql_review_response,
+    _table_sql_preview,
+    approved_program_mismatch,
+)
 from metabase_agent.agent.state import AgentState
 from metabase_agent.agent.trace import append_trace as _append_trace
 from metabase_agent.query.query_program_builder import (
@@ -292,9 +297,12 @@ def _table_aggregation(state: AgentState, client: MetabaseClient, req: _Metadata
     if mapped_agent_field_ids:
         program["agent_field_ids"] = mapped_agent_field_ids
     query_plan = {"intent": req.intent, "database_name": database_display_name, "schema_name": req.schema_name, "table_name": table_display_name, "field_name": req.field_name or (str(field.get("name") or field.get("display_name")) if field else None), "date_field_name": req.date_field_name or (str(date_field.get("name") or date_field.get("display_name")) if date_field else None), "aggregation_function": req.aggregation_function, "relative_days": req.relative_days, "time_grain": req.time_grain}
-    if not state.get("sql_approved"):
+    if not state.get("sql_approved") or approved_program_mismatch(state, program):
         sql = _table_sql_preview(req.schema_name, table_display_name, req.aggregation_function, field, date_field, req.relative_days, req.time_grain)
-        return _sql_review_response(sql, {**program, "preview_sql": sql}, query_plan, trace, preview_only=True)
+        response = _sql_review_response(sql, {**program, "preview_sql": sql}, query_plan, trace, preview_only=True)
+        if state.get("sql_approved"):
+            response["answer"] = _APPROVAL_MISMATCH_NOTE + "\n\n" + str(response["answer"])
+        return response
     if state.get("dry_run"):
         if date_field_id is not None and req.time_grain:
             date_field_display_name = str(date_field["display_name"] or date_field["name"]) if date_field else "date"

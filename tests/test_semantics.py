@@ -145,3 +145,27 @@ def test_safe_rule_intent_override_allows_sql_explain_execute_split() -> None:
     assert is_safe_rule_intent_override("native_sql_query", "sql_explanation") is True
     assert is_safe_rule_intent_override("sql_explanation", "native_sql_query") is True
     assert is_safe_rule_intent_override("native_sql_query", "database_table_list") is False
+
+
+def test_latin_keywords_do_not_match_inside_identifiers() -> None:
+    # "accounts"/"discount" contain "count", "summary" contains "sum" —
+    # substring matching misrouted field-list questions into aggregations.
+    parsed = parse_intent("accounts 这个表有哪些字段")
+    assert parsed["intent"] == "table_field_list"
+    assert parsed["aggregation_function"] is None
+
+    parsed = parse_intent("discount 这个表有哪些字段")
+    assert parsed["intent"] == "table_field_list"
+    assert parsed["aggregation_function"] is None
+
+
+def test_avg_keyword_not_shadowed_by_summary_identifier() -> None:
+    from metabase_agent.semantics.intent_parser import extract_aggregation_function
+
+    assert extract_aggregation_function("summary 表 求平均") == "avg"
+
+
+def test_count_still_matches_after_cjk_text() -> None:
+    from metabase_agent.semantics.intent_parser import extract_aggregation_function
+
+    assert extract_aggregation_function("最近7天的每天的数据count") == "count"

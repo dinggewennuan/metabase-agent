@@ -331,9 +331,11 @@ def test_ask_api_returns_error_payload_instead_of_500(monkeypatch: pytest.Monkey
 
     assert response.status_code == 200
     data = response.json()
-    assert data["query_result"] == {"status": "failed", "error": "network failed"}
-    assert data["trace"] == [{"step": "api.ask", "status": "failed", "error": "network failed"}]
+    # Raw exception text may leak internal URLs/hosts; the API only exposes the class name.
+    assert data["query_result"] == {"status": "failed", "error": "RuntimeError"}
+    assert data["trace"] == [{"step": "api.ask", "status": "failed", "error": "RuntimeError"}]
     assert "查询失败" in data["answer"]
+    assert "network failed" not in data["answer"]
 
 
 def test_ask_api_stores_pending_sql_and_executes_after_approval() -> None:
@@ -619,3 +621,58 @@ def test_sqlite_session_ttl_evicts_stale_sessions(tmp_path, monkeypatch: pytest.
     second = client.post("/api/ask", json={"question": "我上次问的内容是什么？", "dry_run": True, "session_id": "ttl"})
 
     assert second.json()["answer"] == "我还没有记住上一轮问题。"
+
+
+def test_ask_api_negated_execute_phrase_is_rejection_not_approval() -> None:
+    client = TestClient(create_app())
+
+    client.post("/api/ask", json={"question": "请执行 SELECT 1 AS ok", "dry_run": True, "session_id": "negation-test"})
+    # "please don't execute" mentions execution but is a rejection; the old
+    # approval-first phrase matching executed the pending SQL here.
+    second = client.post("/api/ask", json={"question": "please don't execute", "dry_run": True, "session_id": "negation-test"})
+
+    data = second.json()
+    assert data["query_result"]["status"] == "rejected"
+    assert "negation-test" not in PENDING_SQL_APPROVALS
+
+
+def test_ask_api_chinese_negated_execute_phrase_is_rejection() -> None:
+    client = TestClient(create_app())
+
+    client.post("/api/ask", json={"question": "请执行 SELECT 1 AS ok", "dry_run": True, "session_id": "negation-zh"})
+    second = client.post("/api/ask", json={"question": "先不要执行", "dry_run": True, "session_id": "negation-zh"})
+
+    assert second.json()["query_result"]["status"] == "rejected"
+
+
+def test_ask_api_second_approve_finds_nothing_to_execute() -> None:
+    client = TestClient(create_app())
+
+    client.post("/api/ask", json={"question": "请执行 SELECT 1 AS ok", "dry_run": True, "session_id": "double-approve"})
+    first = client.post("/api/ask", json={"question": "确认执行", "dry_run": True, "session_id": "double-approve"})
+    second = client.post("/api/ask", json={"question": "确认执行", "dry_run": True, "session_id": "double-approve"})
+
+    # The approval is take-once: a duplicate approve (double-click, concurrent
+    # request) must not execute the same SQL a second time.
+    assert first.json()["query_result"]["dry_run"] is True
+    assert first.json()["program"] == {"type": "native_sql", "database_id": 19, "sql": "SELECT 1 AS ok"}
+    second_data = second.json()
+    assert second_data["program"] != {"type": "native_sql", "database_id": 19, "sql": "SELECT 1 AS ok"}
+    assert second_data["query_result"].get("sql") != "SELECT 1 AS ok"
+
+
+def test_ask_api_approval_bound_to_reviewed_program() -> None:
+    client = TestClient(create_app())
+
+    review = client.post("/api/ask", json={"question": "请执行 SELECT 1 AS ok", "dry_run": True, "session_id": "binding-test"})
+    assert review.json()["query_result"]["status"] == "requires_approval"
+
+    # Simulate drift between review and approval (e.g. non-deterministic
+    # re-planning): the stored fingerprint no longer matches what would run.
+    PENDING_SQL_APPROVALS["binding-test"]["program_hash"] = "tampered"
+
+    approved = client.post("/api/ask", json={"question": "确认执行", "dry_run": True, "session_id": "binding-test"})
+
+    data = approved.json()
+    assert data["query_result"]["status"] == "requires_approval"
+    assert "不一致" in data["answer"]

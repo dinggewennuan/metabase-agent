@@ -7,6 +7,7 @@ class AgentState(TypedDict, total=False):
     question: str
     dry_run: bool
     sql_approved: bool
+    approved_program_hash: str | None
     memory_context: str
     skills_context: str
     tenant_id: str

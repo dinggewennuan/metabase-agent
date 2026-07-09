@@ -137,6 +137,12 @@ class AgentTools:
             return handler(arguments)
         except httpx.HTTPStatusError as exc:
             return {"status": "failed", "error": f"{exc.response.status_code} {exc.response.reason_phrase}"}
+        except httpx.HTTPError as exc:
+            # Connect/timeout errors become a tool failure the LLM can react
+            # to, instead of a 500 for the whole /ask request.
+            return {"status": "failed", "error": f"{type(exc).__name__}: request to Metabase failed"}
+        except (KeyError, TypeError, ValueError) as exc:
+            return {"status": "failed", "error": f"unexpected response shape: {type(exc).__name__}"}
 
     def _databases(self) -> list[dict[str, Any]]:
         if self.dry_run:
@@ -236,11 +242,19 @@ class AgentTools:
                 raise
             return self.client().execute_mbql_query(table_aggregation_dataset_payload(database_id, program))
 
-    def _resolve_database_id(self, database_name: str | None) -> int:
+    def _resolve_database_id(self, database_name: str | None) -> int | None:
+        """Resolve a database name to its id.
+
+        Only an OMITTED name falls back to the default BigQuery database; an
+        unknown name returns None — silently running the SQL against a
+        different database than the caller asked for is never acceptable.
+        """
         if not database_name:
             return self.bigquery_database_id
         database = _find_database(self._databases(), database_name)
-        return int(database["id"]) if database and database.get("id") is not None else self.bigquery_database_id
+        if database is None or database.get("id") is None:
+            return None
+        return int(database["id"])
 
     def _run_sql(self, arguments: dict[str, Any]) -> dict[str, Any]:
         sql = extract_native_sql(str(arguments.get("sql") or "")) or str(arguments.get("sql") or "")
@@ -251,4 +265,6 @@ class AgentTools:
         if self.dry_run:
             return {"status": "completed", "row_count": 0, "data": {"cols": [], "rows": []}, "dry_run": True, "sql": sql}
         database_id = self._resolve_database_id(arguments.get("database_name"))
+        if database_id is None:
+            return {"status": "not_found", "error": f"database not found: {arguments.get('database_name')}", "sql": sql}
         return {**self.client().execute_native_query(database_id, sql), "sql": sql}

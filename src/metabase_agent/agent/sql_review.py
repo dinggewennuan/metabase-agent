@@ -1,11 +1,37 @@
 """SQL review/approval responses, the equivalent-preview SQL builder, and execution-intent detection."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from metabase_agent.agent.state import AgentState
 from metabase_agent.agent.trace import append_trace
+
+# Presentation-only keys that differ between the reviewed program and the
+# rebuilt one; everything else must match or the approval does not apply.
+_FINGERPRINT_IGNORED_KEYS = {"requires_approval", "execute", "preview_sql"}
+
+
+def program_fingerprint(program: Mapping[str, Any] | None) -> str | None:
+    """Stable hash of what a program will actually execute.
+
+    Stored alongside a pending approval and re-checked before execution, so an
+    approval only ever authorizes the exact query the user reviewed.
+    """
+    if not isinstance(program, Mapping) or not program:
+        return None
+    payload = {key: value for key, value in program.items() if key not in _FINGERPRINT_IGNORED_KEYS}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def approved_program_mismatch(state: Mapping[str, Any], program: Mapping[str, Any]) -> bool:
+    expected = state.get("approved_program_hash")
+    return bool(expected) and program_fingerprint(program) != expected
+
+
+_APPROVAL_MISMATCH_NOTE = "本次生成的查询与之前审批的内容不一致，已重新进入审批流程。"
 
 
 def _should_execute_generated_sql(question: str) -> bool:

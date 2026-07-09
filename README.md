@@ -32,12 +32,12 @@
 ## 项目亮点
 
 - **双内核**：规则管道（确定、可离线、可测）与 LLM 工具循环（灵活、自主探查）共存，靠 `AGENT_MODE` 一键切换，无 key 自动回退 pipeline。
-- **安全优先**：只读 SQL 校验（字面量/注释/反引号掩码 + 单语句检测 + scripting 黑名单）、查询策略（limit ≤ 200、聚合函数白名单）、**SQL 执行前人工审批**闸口；三个入口（API/SSE/CLI）共用同一套闸口。
+- **安全优先**：只读 SQL 校验（字面量/注释/反引号掩码 + 单语句检测 + scripting 黑名单）、查询策略（limit ≤ 200、聚合函数白名单）、**SQL 执行前人工审批**闸口；三个入口（API/SSE/CLI）共用同一套闸口。审批是"取出即消费"的原子操作（并发批准不会重复执行），且**批准绑定被 review 的内容**——执行前按指纹比对，内容有偏移会重新进入审批。
 - **全程可观测**：每一步都进 Trace；SSE 逐节点 / 逐工具推送进度，前端实时渲染处理过程。
 - **会话能力**：按 `session_id` 的多轮记忆、待审批 SQL 与表上下文持久化，重启不丢。
 - **多 worker 就绪**：状态后端可插拔，`AGENT_STORE=sqlite`（WAL）让多 worker 共享会话/审批/表上下文，支持 session TTL。
 - **OpenAI 兼容网关友好**：双 wire 协议（`chat_completions` 走 SDK、`responses` 走裸 httpx），适配自建/代理网关。
-- **工程化完备**：167 个单测、ruff、basedpyright 0 错、CI、Dockerfile、`ping` 连通性自检。
+- **工程化完备**：209 个单测、ruff、CI（含 Docker build 校验）、多阶段非 root Dockerfile、`ping` 连通性自检。
 
 ---
 
@@ -268,10 +268,11 @@ cp .env.example .env
 
 ## 安全与策略
 
-- **只读 SQL 校验**：必须以 `SELECT`/`WITH` 开头、单语句；对字面量/注释/反引号做掩码后再比对关键词黑名单（`INSERT/UPDATE/DELETE/DROP/...` 及 BigQuery scripting：`CALL/EXECUTE/EXPORT/LOAD/DECLARE`）。
-- **查询策略**（`policy/query_policy.py`）：`limit ≤ 200`、聚合函数白名单、source 类型校验。
-- **人工审批**：生成的 SQL / 结构化查询执行前需显式授权（`decision=approve`）；粘贴新 SQL 不会被误判为对上一条的批准。
-- **鉴权**：`AGENT_API_TOKEN` + 可选 `AGENT_REQUIRE_TOKEN`；真实模式无 token 启动时打印告警。
+- **只读 SQL 校验**：必须以 `SELECT`/`WITH` 开头、单语句；对字面量/注释/反引号做掩码后再比对关键词黑名单（`INSERT/UPDATE/DELETE/DROP/...` 及 BigQuery scripting：`CALL/EXECUTE/EXPORT/LOAD/DECLARE`）。中文注释/中文字符串字面量不影响 SQL 完整性（只有字面量/注释之外的中文才被视为自然语言尾巴截断）。
+- **查询策略**（`policy/query_policy.py`）：`limit ≤ 200`、聚合函数白名单、source 类型校验；sum/avg 自动选字段时排除主键/外键。
+- **人工审批**：生成的 SQL / 结构化查询执行前需显式授权（`decision=approve`）；粘贴新 SQL 不会被误判为对上一条的批准；拒绝短语优先于批准短语（"不要执行"/"do not execute" 永远是拒绝）；批准是原子的 take-once 操作，且绑定被 review 内容的指纹（`agent/sql_review.py:program_fingerprint`），执行内容与审批内容不一致时会重新进入审批。tools 模式挂起时同时记录目标 `database_name`，恢复执行不会落到默认库。
+- **鉴权**：`AGENT_API_TOKEN`（常量时间比较）+ 可选 `AGENT_REQUIRE_TOKEN`；真实模式无 token 启动时打印告警。注意当前是单一共享 token，多用户隔离尚未实现。
+- **错误脱敏**：`/api/ask` 失败只返回异常类名，完整异常进服务端日志。
 - **重试**：Metabase 客户端对 GET/HEAD 在 429/502/503/504 时短暂重试；POST 不自动重试，避免重复执行。
 
 ---
@@ -279,8 +280,8 @@ cp .env.example .env
 ## 测试
 
 ```bash
-uv run pytest                       # 167 单测
-uv run ruff check src tests         # lint
+uv run pytest                       # 209 单测
+uv run ruff check src tests scripts # lint
 uv run python -m compileall src tests
 ```
 
@@ -302,11 +303,12 @@ uv run metabase-agent web --host 127.0.0.1 --port 8765
 uv run uvicorn metabase_agent.api.app:app --host 0.0.0.0 --port 8765
 ```
 
-Docker：
+Docker（多阶段构建、非 root 运行、自带 HEALTHCHECK；镜像内含 `skills/`）：
 
 ```bash
 docker build -t metabase-agent .
-docker run --env-file .env -p 8765:8765 metabase-agent
+# 状态文件默认写到容器内 /app/data，挂卷持久化：
+docker run --env-file .env -p 8765:8765 -v metabase-agent-data:/app/data metabase-agent
 ```
 
 建议：
@@ -327,7 +329,9 @@ docker run --env-file .env -p 8765:8765 metabase-agent
 - **报表为模板驱动的单一报表**：月度 web/api 用量报表是固定模板 + 参数；更多报表建议继续模板化或落成 Metabase saved question。
 - **CLI tools 审批**：CLI 为单次执行，触发 `run_sql` 审批时只打印 SQL，不支持交互式授权（请用 Web 端）。
 - **业务默认值**：`METABASE_BIGQUERY_DATABASE_ID`、报表日期等仍是 akool 部署默认值，开源/换环境前应清空。
-- **CI/Docker 实跑**：CI 工作流与 Dockerfile 已就绪，需推到远端 + 启 Docker daemon 验证。
+- **CI/Docker 实跑**：CI 工作流（lint + pytest + docker build）与 Dockerfile 已就绪，需推到远端 + 启 Docker daemon 验证。
+- **多用户鉴权**：当前是单一共享 `AGENT_API_TOKEN`，持 token 者可读写任意 session 与任意 tenant/user 的长期记忆；多用户场景需要把身份绑定到凭证（per-tenant token 或接入认证系统），禁止请求体直接指定 tenant_id/user_id。
+- **只读校验的纵深防御**：应用层校验是手写词法器，建议生产侧同时用只读 BigQuery 服务账号 + `maximum_bytes_billed`，或引入 `sqlglot` 做 AST 级断言。
 - **长期记忆**：已加入 MongoDB 结构化 memory repository、pgvector 向量索引接口、skills 解析注入；默认关闭长期记忆，详见 `docs/memory-skills-implementation.md`。
 - **pgvector 初始化**：启用长期记忆前先设置 `AGENT_PGVECTOR_DSN`，再运行 `uv run python scripts/init_pgvector_memory.py` 建表和索引。
 
