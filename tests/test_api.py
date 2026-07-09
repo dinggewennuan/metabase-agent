@@ -720,3 +720,16 @@ def test_ask_api_new_question_mentioning_database_is_not_hijacked() -> None:
     data = second.json()
     assert data["query_plan"].get("table_name") != "orders"
     assert data["query_plan"]["intent"] != "table_aggregation"
+
+
+def test_ask_api_reuses_last_database_from_session_context() -> None:
+    client = TestClient(create_app())
+
+    first = client.post("/api/ask", json={"question": "BigQuery-GA 这个数据库下有哪些表", "dry_run": True, "session_id": "default-db"})
+    # No database in this question — the session remembered BigQuery-GA.
+    second = client.post("/api/ask", json={"question": "orders 这个表最近7天的每天的数据count", "dry_run": True, "session_id": "default-db"})
+
+    assert first.json()["query_result"]["status"] == "completed"
+    data = second.json()
+    assert data["query_result"]["status"] == "requires_approval"
+    assert data["query_plan"]["database_name"] == "BigQuery-GA"

@@ -35,6 +35,7 @@ from metabase_agent.query.query_program_builder import (
     build_program,
 )
 from metabase_agent.semantics.intent_parser import (
+    coerce_metric_intent_with_table,
     is_safe_rule_intent_override,
     parse_intent,
     wants_sql_explanation,
@@ -116,6 +117,10 @@ def build_graph(settings: Settings, checkpointer: Any | None = None):
                 else:
                     parsed_intent.update({key: value for key, value in llm_intent.items() if key in parsed_intent or key == "intent"})
                 trace = _append_trace({"trace": trace}, {"step": "parse.llm", "status": "completed", "intent": parsed_intent.get("intent"), "database_name": parsed_intent.get("database_name"), "schema_name": parsed_intent.get("schema_name"), "table_name": parsed_intent.get("table_name")})
+        intent_before_coercion = parsed_intent.get("intent")
+        parsed_intent = coerce_metric_intent_with_table(parsed_intent)
+        if parsed_intent.get("intent") != intent_before_coercion:
+            trace = _append_trace({"trace": trace}, {"step": "parse.coerce", "from": intent_before_coercion, "to": parsed_intent.get("intent"), "table_name": parsed_intent.get("table_name")})
         return {"parsed_intent": parsed_intent, "trace": trace}
 
     def route_after_parse(state: AgentState) -> str:

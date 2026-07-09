@@ -68,10 +68,17 @@ class _MetadataRequest:
     @classmethod
     def from_state(cls, state: AgentState) -> _MetadataRequest:
         parsed = cast(Mapping[str, Any], state.get("parsed_intent", {}))
+        database_name = str(parsed.get("database_name") or "")
+        schema_name = cast(str | None, parsed.get("schema_name"))
+        # "BigQuery-GA 数据库下的fs_results" parses the DATABASE name into the
+        # schema slot; a schema equal to the database is never meaningful in
+        # Metabase and would filter out every table.
+        if schema_name and database_name and schema_name.casefold() == database_name.casefold():
+            schema_name = None
         return cls(
             intent=str(parsed.get("intent") or ""),
-            database_name=str(parsed.get("database_name") or ""),
-            schema_name=cast(str | None, parsed.get("schema_name")),
+            database_name=database_name,
+            schema_name=schema_name,
             table_name=str(parsed.get("table_name") or ""),
             field_name=str(parsed.get("field_name") or ""),
             date_field_name=str(parsed.get("date_field_name") or ""),
@@ -85,6 +92,13 @@ class _MetadataRequest:
 def run_database_metadata(state: AgentState, client: MetabaseClient) -> AgentState:
     req = _MetadataRequest.from_state(state)
     dry_run = bool(state.get("dry_run"))
+    session_default_database = str(state.get("default_database_name") or "")
+    default_database_applied = False
+    if req.intent in {"table_field_list", "table_aggregation"} and not req.database_name and not req.schema_name and session_default_database:
+        # The user already told us the database earlier in this session
+        # (e.g. by listing its tables) — reuse it instead of asking again.
+        req.database_name = session_default_database
+        default_database_applied = True
 
     if dry_run:
         databases = _dry_databases()
@@ -97,6 +111,9 @@ def run_database_metadata(state: AgentState, client: MetabaseClient) -> AgentSta
         databases = _database_items(client.list_databases())
         trace = _append_trace({"trace": trace}, {"step": "metabase.response", "endpoint": "GET /api/database", "database_names": [database.get("name") for database in databases]})
         tables = []
+
+    if default_database_applied:
+        trace = _append_trace({"trace": trace}, {"step": "metadata.default_database", "database_name": req.database_name, "source": "session_context"})
 
     if req.intent == "database_count":
         return {

@@ -425,6 +425,7 @@ class _PreparedAsk:
     memory_context: str = ""
     skills_context: str = ""
     approved: dict[str, Any] | None = None
+    default_database_name: str | None = None
 
 
 def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk | None]:
@@ -435,6 +436,7 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
     question = payload.question
     sql_approved = False
     approved: dict[str, Any] | None = None
+    default_database_name: str | None = None
     # Rejection is checked BEFORE approval: "do not execute" must never be
     # read as an approval just because it mentions execution.
     if pending_sql and _is_sql_rejection(question, payload.decision):
@@ -469,6 +471,7 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
         sql_approved = True
     else:
         context = _get_table_context(payload.session_id)
+        default_database_name = str((context or {}).get("database_name") or "") or None
         rewritten = _fill_database_clarification_follow_up(question, context)
         if rewritten is not None:
             question = rewritten
@@ -500,6 +503,7 @@ def _prepare_ask(payload: AskRequest) -> tuple[AskResponse | None, _PreparedAsk 
         memory_context=memory_context,
         skills_context=skills_context,
         approved=approved,
+        default_database_name=default_database_name,
     )
 
 
@@ -563,13 +567,27 @@ def _finalize_ask(payload: AskRequest, run: _PreparedAsk, result: dict[str, Any]
         elif isinstance(query_plan, dict) and isinstance(query_plan.get("table_name"), str) and query_result.get("status") == "completed":
             selected_table = query_plan["table_name"]
             selected_schema = query_plan.get("schema_name")
+        selected_database = None
+        if query_result.get("status") == "completed":
+            for source in (query_result, query_plan if isinstance(query_plan, dict) else {}):
+                name = source.get("database_name")
+                if isinstance(name, str) and name:
+                    selected_database = name
+                    break
         if selected_table:
             data = {"schema_name": selected_schema, "table_name": selected_table}
+            if selected_database:
+                data["database_name"] = selected_database
             if isinstance(query_plan, dict):
                 for key in ("aggregation_function", "relative_days", "time_grain", "date_field_name", "field_name"):
                     if query_plan.get(key) is not None:
                         data[key] = query_plan.get(key)
             _set_table_context(payload.session_id, data)
+        elif selected_database:
+            # No single table selected (e.g. the user listed a database's
+            # tables) — still remember the database so the next table question
+            # doesn't have to ask "which database?" again.
+            _set_table_context(payload.session_id, {"database_name": selected_database})
         elif not suggestions and query_result.get("status") == "completed":
             _pop_table_context(payload.session_id)
     _remember(payload.session_id, "user", payload.question)
@@ -717,6 +735,7 @@ def _graph_input(run: _PreparedAsk) -> dict[str, Any]:
         "dry_run": run.dry_run,
         "sql_approved": run.sql_approved,
         "approved_program_hash": (run.approved or {}).get("program_hash"),
+        "default_database_name": run.default_database_name,
         "tenant_id": run.tenant_id,
         "user_id": run.user_id,
         "memory_context": run.memory_context,

@@ -728,3 +728,49 @@ def test_detail_lookup_answer_reports_row_count() -> None:
 
     assert "2" in answer
     assert "明细" in answer
+
+
+def test_llm_metric_guess_with_named_table_routes_to_table_aggregation(monkeypatch) -> None:
+    # Real-world failure: the LLM classified "分析fs_results…每天count…增长情况"
+    # as metric_trend, and the metric-search path answered
+    # "没有找到明确的数据指标" even though the user named a concrete table.
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.parse_intent_with_llm",
+        lambda question, settings: {"intent": "metric_trend", "table_name": "orders"},
+    )
+    monkeypatch.setattr(
+        "metabase_agent.agent.graph.MetabaseClient.list_databases",
+        lambda self: {"data": [{"id": 19, "name": "BigQuery-GA"}, {"id": 1, "name": "business_data"}]},
+    )
+    graph = build_graph(Settings(AGENT_DRY_RUN=False, METABASE_API_KEY="test-key", OPENAI_API_KEY="k"))
+
+    result = graph.invoke({"question": "分析一下orders 这个最近一个星期的每天count的数据，并分析一下增长或者降低情况", "dry_run": False})
+
+    assert result["parsed_intent"]["intent"] == "table_aggregation"
+    assert result["parsed_intent"]["relative_days"] == 7
+    # Without a database it must ask WHICH database — not hunt for a Metric.
+    assert result["query_result"]["status"] == "requires_clarification"
+    assert result["query_result"]["clarification_type"] == "database"
+
+
+def test_session_default_database_avoids_reasking(monkeypatch) -> None:
+    graph = build_graph(Settings(AGENT_DRY_RUN=True))
+
+    result = graph.invoke({"question": "orders 这个表最近7天的每天的数据count", "dry_run": True, "default_database_name": "BigQuery-GA"})
+
+    # The session already knows the database — no clarification round-trip.
+    assert result["query_result"]["status"] == "requires_approval"
+    assert result["query_plan"]["database_name"] == "BigQuery-GA"
+    assert any(event.get("step") == "metadata.default_database" for event in result["trace"])
+
+
+def test_schema_equal_to_database_is_ignored() -> None:
+    graph = build_graph(Settings(AGENT_DRY_RUN=True))
+
+    # "X 数据库下的…" parses the database name into the schema slot too; the
+    # schema filter would then remove every table (their schema is the
+    # BigQuery dataset, never the database name).
+    result = graph.invoke({"question": "BigQuery-GA 这个数据库下的orders 这个表有哪些字段", "dry_run": True})
+
+    assert result["query_result"]["status"] == "completed"
+    assert result["query_result"]["table_name"] == "orders"

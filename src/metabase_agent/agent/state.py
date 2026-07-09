@@ -8,6 +8,7 @@ class AgentState(TypedDict, total=False):
     dry_run: bool
     sql_approved: bool
     approved_program_hash: str | None
+    default_database_name: str | None
     memory_context: str
     skills_context: str
     tenant_id: str

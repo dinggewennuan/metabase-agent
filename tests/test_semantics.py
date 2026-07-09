@@ -169,3 +169,25 @@ def test_count_still_matches_after_cjk_text() -> None:
     from metabase_agent.semantics.intent_parser import extract_aggregation_function
 
     assert extract_aggregation_function("最近7天的每天的数据count") == "count"
+
+
+def test_parse_recent_week_and_month_map_to_days() -> None:
+    from metabase_agent.semantics.intent_parser import extract_relative_days
+
+    assert extract_relative_days("最近一个星期的每天count") == 7
+    assert extract_relative_days("近一周的数据") == 7
+    assert extract_relative_days("最近一个月的数据") == 30
+    assert extract_relative_days("最近3天") == 3
+
+
+def test_named_table_beats_metric_guess() -> None:
+    from metabase_agent.semantics.intent_parser import coerce_metric_intent_with_table
+
+    # "分析增长" reads like a trend question, but a concrete table means the
+    # metric-search path would dead-end with "没有找到明确的数据指标".
+    coerced = coerce_metric_intent_with_table({"intent": "metric_trend", "table_name": "fs_results", "aggregation_function": None})
+    assert coerced["intent"] == "table_aggregation"
+    assert coerced["aggregation_function"] == "count"
+
+    untouched = coerce_metric_intent_with_table({"intent": "metric_trend", "table_name": None})
+    assert untouched["intent"] == "metric_trend"

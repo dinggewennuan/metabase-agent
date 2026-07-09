@@ -224,11 +224,33 @@ def extract_relative_days(question: str) -> int | None:
     match = re.search(r"(?:最近|近|过去)\s*(\d+)\s*天", question)
     if match:
         return int(match.group(1))
+    if re.search(r"(?:最近|近|过去)\s*(?:一个?)?(?:星期|周)", question):
+        return 7
+    if re.search(r"(?:最近|近|过去)\s*(?:一个)?月", question):
+        return 30
     if "昨天" in question:
         return 1
     if "上周" in question:
         return 7
     return None
+
+
+_METRIC_INTENTS_COERCIBLE = {"metric_value", "metric_trend", "comparison"}
+
+
+def coerce_metric_intent_with_table(parsed: dict) -> dict:
+    """Route metric-ish intents to table aggregation when a table is named.
+
+    "分析一下fs_results 最近一周每天count……" reads like a trend question, so
+    the (LLM) classifier says metric_trend — but the metric path searches
+    Metabase Metrics and dead-ends with "没有找到明确的数据指标" even though the
+    user pointed at a concrete table. A named table beats a metric guess.
+    """
+    if parsed.get("table_name") and parsed.get("intent") in _METRIC_INTENTS_COERCIBLE:
+        parsed["intent"] = "table_aggregation"
+    if parsed.get("intent") == "table_aggregation" and not parsed.get("aggregation_function"):
+        parsed["aggregation_function"] = "count"
+    return parsed
 
 
 def extract_time_grain(question: str) -> str | None:
