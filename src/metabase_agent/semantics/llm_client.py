@@ -1,8 +1,14 @@
-"""Unified LLM access for both wire protocols.
+"""Unified LLM access for the supported wire protocols.
 
-The "responses" path intentionally uses raw httpx instead of the OpenAI SDK:
-the OpenAI-compatible gateway used in production does not accept SDK-shaped
-/responses requests. Do not "simplify" this back to the SDK.
+Wire protocols (OPENAI_WIRE_API):
+- "chat_completions"        /chat/completions via the OpenAI SDK (default)
+- "chat_completions_httpx"  /chat/completions via raw httpx — for gateways
+  whose WAF rejects the SDK's request fingerprint (x-stainless-* headers,
+  SDK User-Agent) with 403 "Your request was blocked"
+- "responses"               /responses via raw httpx
+
+The raw-httpx paths are intentional: the OpenAI-compatible gateways used in
+production reject SDK-shaped requests. Do not "simplify" them back to the SDK.
 """
 from __future__ import annotations
 
@@ -48,6 +54,8 @@ def complete(system_prompt: str, user_content: str, settings: Settings, *, json_
         raise RuntimeError("OPENAI_API_KEY is not configured")
     if settings.openai_wire_api == "responses":
         return _complete_responses(system_prompt, user_content, settings)
+    if settings.openai_wire_api == "chat_completions_httpx":
+        return _complete_chat_httpx(system_prompt, user_content, settings, json_mode=json_mode)
     return _complete_chat(system_prompt, user_content, settings, json_mode=json_mode)
 
 
@@ -67,6 +75,52 @@ def _complete_responses(system_prompt: str, user_content: str, settings: Setting
     if not text:
         raise RuntimeError("empty LLM response")
     return text
+
+
+def _post_chat_completions(settings: Settings, body: dict[str, Any]) -> dict[str, Any]:
+    # Plain httpx with only Authorization/Content-Type: no SDK fingerprint
+    # headers for a gateway WAF to block.
+    response = httpx.post(
+        f"{settings.openai_base_url.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+        json=body,
+        timeout=settings.openai_timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def _chat_payload_message(payload: dict[str, Any]) -> dict[str, Any]:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return {}
+    message = choices[0].get("message")
+    return message if isinstance(message, dict) else {}
+
+
+def _complete_chat_httpx(system_prompt: str, user_content: str, settings: Settings, *, json_mode: bool) -> str:
+    body: dict[str, Any] = {
+        "model": settings.openai_model,
+        "reasoning_effort": reasoning_effort(settings.openai_model),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+    }
+    if json_mode:
+        try:
+            payload = _post_chat_completions(settings, {**body, "temperature": 0, "response_format": {"type": "json_object"}})
+        except httpx.HTTPStatusError:
+            # Same fallback as the SDK path: gateways that reject
+            # response_format still get a plain JSON-by-prompt attempt.
+            payload = _post_chat_completions(settings, {**body, "temperature": 0})
+    else:
+        payload = _post_chat_completions(settings, body)
+    text = str(_chat_payload_message(payload).get("content") or "")
+    if not text.strip():
+        raise RuntimeError("empty LLM response")
+    return text.strip()
 
 
 def _complete_chat(system_prompt: str, user_content: str, settings: Settings, *, json_mode: bool) -> str:
@@ -189,6 +243,35 @@ class ChatToolTransport:
         return (choice.content or "").strip()
 
 
+class ChatHttpxToolTransport:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str | list[ToolCall]:
+        payload = _post_chat_completions(
+            self.settings,
+            {
+                "model": self.settings.openai_model,
+                "reasoning_effort": reasoning_effort(self.settings.openai_model),
+                "messages": _chat_messages(messages),
+                "tools": [{"type": "function", "function": tool} for tool in tools],
+            },
+        )
+        message = _chat_payload_message(payload)
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            raw: list[tuple[str, str, str]] = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if isinstance(function, dict):
+                    raw.append((str(call.get("id") or ""), str(function.get("name") or ""), str(function.get("arguments") or "")))
+            if raw:
+                return _to_tool_calls(raw)
+        return str(message.get("content") or "").strip()
+
+
 def _chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for message in messages:
@@ -208,7 +291,9 @@ def _chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return converted
 
 
-def build_tool_transport(settings: Settings) -> ResponsesToolTransport | ChatToolTransport:
+def build_tool_transport(settings: Settings) -> ResponsesToolTransport | ChatToolTransport | ChatHttpxToolTransport:
     if settings.openai_wire_api == "responses":
         return ResponsesToolTransport(settings)
+    if settings.openai_wire_api == "chat_completions_httpx":
+        return ChatHttpxToolTransport(settings)
     return ChatToolTransport(settings)

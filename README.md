@@ -36,7 +36,7 @@
 - **全程可观测**：每一步都进 Trace；SSE 逐节点 / 逐工具推送进度，前端实时渲染处理过程。
 - **会话能力**：按 `session_id` 的多轮记忆、待审批 SQL 与表上下文持久化，重启不丢。
 - **多 worker 就绪**：状态后端可插拔，`AGENT_STORE=sqlite`（WAL）让多 worker 共享会话/审批/表上下文，支持 session TTL。
-- **OpenAI 兼容网关友好**：双 wire 协议（`chat_completions` 走 SDK、`responses` 走裸 httpx），适配自建/代理网关。
+- **OpenAI 兼容网关友好**：三种 wire 协议（`chat_completions` 走 SDK、`chat_completions_httpx` 同端点裸 httpx、`responses` 走裸 httpx），适配自建/代理网关——包括 WAF 拦 SDK 请求指纹的网关。
 - **工程化完备**：209 个单测、ruff、CI（含 Docker build 校验）、多阶段非 root Dockerfile、`ping` 连通性自检。
 
 ---
@@ -220,7 +220,7 @@ cp .env.example .env
 | `OPENAI_API_KEY` | 空 | LLM key；空则仅 pipeline + 不调 LLM |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容网关地址 |
 | `OPENAI_MODEL` | `gpt-5` | 模型名 |
-| `OPENAI_WIRE_API` | `chat_completions` | `chat_completions`（SDK）或 `responses`（裸 httpx） |
+| `OPENAI_WIRE_API` | `chat_completions` | `chat_completions`（SDK）、`chat_completions_httpx`（同端点裸 httpx，网关 WAF 拦 SDK 指纹返回 403 时用）或 `responses`（裸 httpx） |
 | `OPENAI_TIMEOUT` | `120` | LLM 请求超时（秒） |
 | `SILICONFLOW_API_KEY` | 空 | SiliconFlow embedding key；`AGENT_EMBEDDING_PROVIDER=siliconflow` 时必填 |
 | `SILICONFLOW_BASE_URL` | `https://api.siliconflow.cn/v1` | SiliconFlow API base URL |

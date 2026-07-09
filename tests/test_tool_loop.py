@@ -436,3 +436,72 @@ def test_dispatch_turns_network_errors_into_tool_failures() -> None:
 
     assert result["status"] == "failed"
     assert "ConnectError" in result["error"]
+
+
+def test_chat_httpx_adapter_parses_tool_calls_without_sdk_headers(monkeypatch) -> None:
+    from metabase_agent.semantics import llm_client
+
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {"id": "c1", "type": "function", "function": {"name": "list_databases", "arguments": "{}"}}
+                            ],
+                        }
+                    }
+                ]
+            }
+
+    def _fake_post(url: str, **kwargs: Any) -> _Resp:
+        captured["url"] = url
+        captured["headers"] = kwargs.get("headers")
+        captured["json"] = kwargs.get("json")
+        return _Resp()
+
+    monkeypatch.setattr(llm_client.httpx, "post", _fake_post)
+    transport = llm_client.ChatHttpxToolTransport(Settings(OPENAI_API_KEY="k", OPENAI_WIRE_API="chat_completions_httpx"))
+
+    reply = transport.complete([{"role": "user", "content": "dbs?"}], tool_schemas())
+
+    assert isinstance(reply, list)
+    assert reply[0].name == "list_databases"
+    assert captured["url"].endswith("/chat/completions")
+    # No SDK fingerprint headers — only auth and content type, so gateway
+    # WAFs that 403 the OpenAI SDK accept these requests.
+    assert set(captured["headers"]) == {"Authorization", "Content-Type"}
+    assert captured["json"]["tools"][0]["type"] == "function"
+
+
+def test_chat_httpx_adapter_parses_final_text(monkeypatch) -> None:
+    from metabase_agent.semantics import llm_client
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"choices": [{"message": {"content": "有 3 个库。"}}]}
+
+    monkeypatch.setattr(llm_client.httpx, "post", lambda url, **kwargs: _Resp())
+    transport = llm_client.ChatHttpxToolTransport(Settings(OPENAI_API_KEY="k", OPENAI_WIRE_API="chat_completions_httpx"))
+
+    reply = transport.complete([{"role": "user", "content": "dbs?"}], tool_schemas())
+
+    assert reply == "有 3 个库。"
+
+
+def test_build_tool_transport_selects_chat_httpx(monkeypatch) -> None:
+    from metabase_agent.semantics import llm_client
+
+    transport = llm_client.build_tool_transport(Settings(OPENAI_API_KEY="k", OPENAI_WIRE_API="chat_completions_httpx"))
+
+    assert isinstance(transport, llm_client.ChatHttpxToolTransport)
