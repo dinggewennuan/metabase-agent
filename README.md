@@ -241,6 +241,7 @@ cp .env.example .env
 | `AGENT_TENANT_ID` | `default` | 长期记忆租户 ID |
 | `AGENT_USER_ID` | 空 | 长期记忆用户 ID；API 为空时默认用 `session_id` |
 | `AGENT_LONG_TERM_MEMORY_ENABLED` | `false` | 是否启用 MongoDB + pgvector 长期记忆 |
+| `AGENT_MEMORY_LLM_EXTRACTOR` | `false` | 每轮问答后用 LLM 提取候选记忆（语义偏好 + procedural 规则提案，规则一律 `pending_review`）；需 `OPENAI_API_KEY` |
 | `AGENT_MONGODB_URI` | 空 | 长期记忆 MongoDB URI |
 | `AGENT_MONGODB_DATABASE` | `metabase_agent` | 长期记忆 MongoDB database |
 | `AGENT_MEMORY_COLLECTION` | `agent_memories` | 长期记忆集合 |

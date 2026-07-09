@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from metabase_agent.config.settings import Settings
@@ -33,12 +34,22 @@ from metabase_agent.memory.vector import (
 
 _LOGGER = logging.getLogger("metabase_agent")
 
+# (question, answer, query_plan) -> LLM-proposed candidates.
+LlmExtractor = Callable[[str, str, dict[str, Any] | None], list[CandidateMemory]]
+
 
 class MemoryManager:
-    def __init__(self, repository: MemoryRepository, vector_index: VectorIndex, embedding_provider: EmbeddingProvider) -> None:
+    def __init__(
+        self,
+        repository: MemoryRepository,
+        vector_index: VectorIndex,
+        embedding_provider: EmbeddingProvider,
+        llm_extractor: LlmExtractor | None = None,
+    ) -> None:
         self.repository = repository
         self.vector_index = vector_index
         self.embedding_provider = embedding_provider
+        self.llm_extractor = llm_extractor
 
     def load_context(self, *, tenant_id: str, user_id: str, query: str, limit: int = 5) -> MemoryContext:
         semantic_ns = user_namespace(tenant_id, user_id, MemoryType.SEMANTIC)
@@ -77,12 +88,25 @@ class MemoryManager:
         query_result: dict[str, Any] | None = None,
         query_plan: dict[str, Any] | None = None,
     ) -> list[MemoryRecord]:
+        candidates = self._extract_candidates(question=question, answer=answer, query_result=query_result, query_plan=query_plan)
+        candidates.extend(self._llm_candidates(question=question, answer=answer, query_plan=query_plan))
         records: list[MemoryRecord] = []
-        for candidate in self._extract_candidates(question=question, answer=answer, query_result=query_result, query_plan=query_plan):
+        for candidate in candidates:
             record = self._upsert_candidate(tenant_id=tenant_id, user_id=user_id, candidate=candidate)
             if record is not None:
                 records.append(record)
         return records
+
+    def _llm_candidates(self, *, question: str, answer: str, query_plan: dict[str, Any] | None) -> list[CandidateMemory]:
+        if self.llm_extractor is None:
+            return []
+        try:
+            return self.llm_extractor(question, answer, query_plan)
+        except Exception:
+            # The deterministic rule-based candidates must still be written
+            # when the LLM proposal step fails.
+            _LOGGER.warning("memory.llm_extractor failed; falling back to rule-based candidates only", exc_info=True)
+            return []
 
     def list_memories(
         self,
@@ -149,6 +173,26 @@ class MemoryManager:
         key = candidate.key or self._default_key(candidate)
         old = self.repository.get(namespace, key)
         now = utc_now_iso()
+        if old is not None and old.content == candidate.content:
+            # Re-observed, unchanged: refresh last_seen but NEVER change the
+            # status — a pending re-proposal must not demote an ACTIVE rule.
+            old.confidence = max(old.confidence, candidate.confidence)
+            old.last_seen = now
+            record = old
+            self.repository.put(record)
+            self._sync_vector(record)
+            return record
+        if (
+            old is not None
+            and old.memory_type == MemoryType.PROCEDURAL
+            and old.status == MemoryStatus.ACTIVE
+            and candidate.status == MemoryStatus.PENDING_REVIEW
+        ):
+            # Conflicting proposal against a reviewed-and-active rule: file it
+            # alongside for human review instead of overwriting the rule.
+            key = f"{key}.conflict.{_hash_text(candidate.content)[:8]}"
+            candidate.metadata = {**candidate.metadata, "conflicts_with": old.key}
+            old = self.repository.get(namespace, key)
         if old is not None:
             old.content = candidate.content
             old.value = candidate.value
@@ -296,7 +340,14 @@ def build_memory_manager(settings: Settings) -> MemoryManager:
     else:
         embedding_provider = HashEmbeddingProvider(settings.agent_embedding_dimensions)
 
-    return MemoryManager(repository, vector_index, embedding_provider)
+    llm_extractor: LlmExtractor | None = None
+    if settings.agent_memory_llm_extractor and settings.openai_api_key:
+        from metabase_agent.memory.extractor import extract_candidates_with_llm
+
+        def llm_extractor(question: str, answer: str, query_plan: dict[str, Any] | None) -> list[CandidateMemory]:
+            return extract_candidates_with_llm(question, answer, query_plan, settings)
+
+    return MemoryManager(repository, vector_index, embedding_provider, llm_extractor=llm_extractor)
 
 
 def _hash_text(text: str) -> str:

@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     agent_tenant_id: str = Field(default="default", alias="AGENT_TENANT_ID")
     agent_user_id: str = Field(default="", alias="AGENT_USER_ID")
     agent_long_term_memory_enabled: bool = Field(default=False, alias="AGENT_LONG_TERM_MEMORY_ENABLED")
+    agent_memory_llm_extractor: bool = Field(default=False, alias="AGENT_MEMORY_LLM_EXTRACTOR")
     agent_mongodb_uri: str = Field(default="", alias="AGENT_MONGODB_URI")
     agent_mongodb_database: str = Field(default="metabase_agent", alias="AGENT_MONGODB_DATABASE")
     agent_memory_collection: str = Field(default="agent_memories", alias="AGENT_MEMORY_COLLECTION")

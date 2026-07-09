@@ -612,6 +612,7 @@ def _require_long_term_memory(settings: Settings) -> None:
 def _memory_manager(settings: Settings) -> MemoryManager:
     key = (
         settings.agent_long_term_memory_enabled,
+        settings.agent_memory_llm_extractor,
         settings.agent_mongodb_uri,
         settings.agent_mongodb_database,
         settings.agent_memory_collection,
@@ -622,6 +623,8 @@ def _memory_manager(settings: Settings) -> MemoryManager:
         settings.agent_embedding_dimensions,
         settings.openai_api_key,
         settings.openai_base_url,
+        settings.openai_model,
+        settings.openai_wire_api,
         settings.siliconflow_api_key,
         settings.siliconflow_base_url,
     )

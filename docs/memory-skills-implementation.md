@@ -129,18 +129,32 @@ AGENT_EMBEDDING_DIMENSIONS=64
 
 ## 当前写入策略
 
-当前实现是保守 MVP：
+两层提取器并存：
+
+**规则提取器（始终开启，确定性基线）**：
 
 - 用户说“以后/记住/默认/偏好”且提到中文时，写 `profile.language`。
 - 用户表达“简洁/直接/详细/工程”等风格时，写 `profile.answer_style`。
 - 查询计划里出现 database/schema/table 时，写默认数据库、schema 和最近表上下文。
 - 查询结束后写一条 `episodic` 分析事件。
 
-后续可以把 `MemoryManager._extract_candidates()` 替换为 LLM extractor：
+**LLM 提取器（`AGENT_MEMORY_LLM_EXTRACTOR=true` 且配置了 `OPENAI_API_KEY` 时启用）**，实现 `memory/extractor.py`，走的正是规划中的链路：
 
 ```text
-messages -> LLM 提取候选 -> 规则过滤 -> 去重/冲突 -> MongoDBStore -> pgvector
+本轮问答 -> LLM 提取候选（仅 semantic/procedural，json_mode）
+        -> 代码规则过滤（置信度 >= 0.6、长度、凭据模式拒绝、key 字符集校验）
+        -> procedural 一律强制 pending_review（无论模型声称什么状态）
+        -> _upsert_candidate 去重/冲突 -> MongoDB -> pgvector
 ```
+
+要点：
+
+- 能识别否定语义与自由格式偏好（例如“users_20xx 这种表之后基本不怎么关注了”会被提为
+  `rule.*` 的 procedural 提案，等待 `POST /api/memories/{id}/status` 审核激活）。
+- LLM 提取失败时自动降级，只写规则提取器的候选，不影响本轮请求。
+- 冲突保护：同 key 内容相同的重复提案只刷新 `last_seen`，绝不把 ACTIVE 规则降级；
+  与 ACTIVE 规则内容冲突的提案写入 `<key>.conflict.<hash>`（metadata 带 `conflicts_with`），
+  原规则保持不变，由人工裁决。
 
 ## 当前检索策略
 
