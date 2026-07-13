@@ -129,9 +129,17 @@ def iter_tool_loop(
                 # the API for having unanswered tool calls.
                 for deferred in reply[index + 1 :]:
                     messages.append(_tool_result_message(deferred.id, deferred.name, {"status": "deferred", "error": "deferred until pending SQL approval is resolved; call again if still needed"}))
+                # Multi-step analyses legitimately need several SQL statements,
+                # each with its own approval. Say so explicitly — otherwise the
+                # repeated review prompt reads like a broken loop.
+                approval_answer = (
+                    "上一条已授权的 SQL 已执行完成。为了继续分析，需要再执行一条**新的** SQL——请 review 后授权执行，或拒绝。"
+                    if approved_sql is not None
+                    else "请先 review 这条 SQL，确认后授权执行，或拒绝本次执行。"
+                )
                 yield "outcome", LoopOutcome(
                     status="requires_approval",
-                    answer="请先 review 这条 SQL，确认后授权执行，或拒绝本次执行。",
+                    answer=approval_answer,
                     trace=trace,
                     messages=messages,
                     pending_sql=sql,

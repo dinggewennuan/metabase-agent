@@ -358,3 +358,23 @@ def test_health_check_probes_wired_backends() -> None:
     checks = dict((name, ok) for name, ok, _detail in manager.health_check())
 
     assert checks == {"memory.mongodb": True, "memory.embedding": True, "memory.pgvector": True}
+
+
+def test_episodic_event_content_is_truncated() -> None:
+    repo = InMemoryMemoryRepository()
+    manager = MemoryManager(repo, InMemoryVectorIndex(), HashEmbeddingProvider())
+
+    long_answer = "结论段落。" * 500  # thousands of chars, like a tools-mode answer
+
+    records = manager.record_interaction(
+        tenant_id="t1",
+        user_id="u1",
+        question="分析一下 fs_results" + "，补充要求" * 100,
+        answer=long_answer,
+        query_result={"status": "completed"},
+        query_plan=None,
+    )
+
+    event = next(record for record in records if record.key.startswith("event.analysis."))
+    assert len(event.content) < 700
+    assert len(str(event.value["answer"])) <= 400

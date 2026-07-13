@@ -320,13 +320,18 @@ class MemoryManager:
                 )
         if query_result and query_result.get("status") in {"completed", "requires_approval", "rejected", "failed"}:
             status = str(query_result.get("status"))
-            summary = f"用户问题：{question}\n处理结果：{answer or status}"
+            # Episodic events are summaries, not transcripts: tools-mode answers
+            # can run to thousands of characters (tables, repeated drafts) and
+            # would bloat both MongoDB and every embedding built from them.
+            question_snippet = _truncate(question, 200)
+            answer_snippet = _truncate(answer or status, 400)
+            summary = f"用户问题：{question_snippet}\n处理结果：{answer_snippet}"
             candidates.append(
                 CandidateMemory(
                     memory_type=MemoryType.EPISODIC,
                     key=f"event.analysis.{_hash_text(summary)[:16]}",
                     content=summary,
-                    value={"question": question, "answer": answer, "status": status},
+                    value={"question": question_snippet, "answer": answer_snippet, "status": status},
                     metadata={"query_result_status": status},
                     confidence=0.72,
                 )
@@ -387,3 +392,8 @@ def build_memory_manager(settings: Settings) -> MemoryManager:
 
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"

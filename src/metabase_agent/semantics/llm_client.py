@@ -94,12 +94,16 @@ def _complete_responses(system_prompt: str, user_content: str, settings: Setting
 def _post_chat_completions(settings: Settings, body: dict[str, Any]) -> dict[str, Any]:
     # Plain httpx with only auth/content-type/UA: no SDK fingerprint headers
     # (x-stainless-*) for a gateway WAF to block.
-    response = httpx.post(
-        f"{settings.openai_base_url.rstrip('/')}/chat/completions",
-        headers=_llm_headers(settings),
-        json=body,
-        timeout=settings.openai_timeout,
-    )
+    url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
+    headers = _llm_headers(settings)
+    try:
+        response = httpx.post(url, headers=headers, json=body, timeout=settings.openai_timeout)
+    except httpx.TransportError:
+        # Gateways/proxies occasionally drop a kept-alive connection without a
+        # response ("Server disconnected"). Nothing was received, so one
+        # immediate retry on a fresh connection is safe — without it a whole
+        # multi-tool turn (including an already-executed approved SQL) is lost.
+        response = httpx.post(url, headers=headers, json=body, timeout=settings.openai_timeout)
     response.raise_for_status()
     payload = response.json()
     return payload if isinstance(payload, dict) else {}

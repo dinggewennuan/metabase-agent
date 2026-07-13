@@ -733,3 +733,23 @@ def test_ask_api_reuses_last_database_from_session_context() -> None:
     data = second.json()
     assert data["query_result"]["status"] == "requires_approval"
     assert data["query_plan"]["database_name"] == "BigQuery-GA"
+
+
+def test_ask_api_shouquan_phrase_approves_pending_sql() -> None:
+    client = TestClient(create_app())
+
+    client.post("/api/ask", json={"question": "请执行 SELECT 1 AS ok", "dry_run": True, "session_id": "shouquan-test"})
+    approved = client.post("/api/ask", json={"question": "授权", "dry_run": True, "session_id": "shouquan-test"})
+
+    data = approved.json()
+    assert data["program"] == {"type": "native_sql", "database_id": 19, "sql": "SELECT 1 AS ok"}
+    assert data["query_result"]["dry_run"] is True
+
+
+def test_ask_api_bu_shouquan_phrase_rejects_pending_sql() -> None:
+    client = TestClient(create_app())
+
+    client.post("/api/ask", json={"question": "请执行 SELECT 1 AS ok", "dry_run": True, "session_id": "bu-shouquan"})
+    second = client.post("/api/ask", json={"question": "不授权", "dry_run": True, "session_id": "bu-shouquan"})
+
+    assert second.json()["query_result"]["status"] == "rejected"

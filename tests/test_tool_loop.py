@@ -577,3 +577,54 @@ def test_chat_httpx_transport_retries_without_reasoning_effort(monkeypatch) -> N
     # tools must survive the fallback — only the optional extras are dropped.
     assert "tools" in attempts[1]
     assert "reasoning_effort" not in attempts[1]
+
+
+def test_chat_httpx_retries_once_on_transport_error(monkeypatch) -> None:
+    from metabase_agent.semantics import llm_client
+
+    attempts: list[int] = []
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    def _fake_post(url: str, **kwargs: Any) -> _Resp:
+        attempts.append(1)
+        if len(attempts) == 1:
+            # Gateway/proxy dropped the kept-alive connection without responding.
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return _Resp()
+
+    monkeypatch.setattr(llm_client.httpx, "post", _fake_post)
+    settings = Settings(OPENAI_API_KEY="k", OPENAI_WIRE_API="chat_completions_httpx")
+
+    text = llm_client.complete("system", "user", settings)
+
+    assert text == "ok"
+    assert len(attempts) == 2
+
+
+def test_resumed_loop_labels_followup_sql_as_new(monkeypatch) -> None:
+    # After an approved SQL executes, the model may need ANOTHER query; the
+    # re-approval prompt must say the previous one already ran, or the repeated
+    # review reads like a broken loop.
+    transport = _ScriptedTransport(
+        [
+            [ToolCall(id="c2", name="run_sql", arguments={"sql": "SELECT 2 AS next_step"})],
+        ]
+    )
+    tools = _tools()
+
+    suspended_messages = [
+        {"role": "user", "content": "分析一下"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "run_sql", "arguments": {"sql": "SELECT 1"}}]},
+    ]
+    outcome = run_tool_loop("", suspended_messages, transport, tools, approved_sql="SELECT 1", approved_tool_call_id="c1")
+
+    assert outcome.status == "requires_approval"
+    assert outcome.pending_sql == "SELECT 2 AS next_step"
+    assert "已执行完成" in outcome.answer
+    assert "新的" in outcome.answer

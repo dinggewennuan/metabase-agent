@@ -316,8 +316,9 @@ def _answer_from_memory(question: str, history: list[dict[str, str]]) -> str | N
 
 # Bare verbs like "execute"/"run it" are deliberately NOT approval phrases:
 # they appear inside negations ("please don't execute") and would fire there.
-_APPROVAL_PHRASES = ("确认执行", "同意执行", "可以执行", "执行吧", "批准执行", "approve")
-_REJECTION_PHRASES = ("拒绝", "取消", "不要执行", "不执行", "不用执行", "别执行", "reject", "cancel", "don't execute", "do not execute", "don't run", "do not run")
+# Rejection is always checked first, so "不授权" wins over "授权".
+_APPROVAL_PHRASES = ("确认执行", "同意执行", "可以执行", "执行吧", "批准执行", "授权执行", "授权", "批准", "approve")
+_REJECTION_PHRASES = ("拒绝", "取消", "不要执行", "不执行", "不用执行", "别执行", "不授权", "不批准", "reject", "cancel", "don't execute", "do not execute", "don't run", "do not run")
 
 
 def _is_sql_approval(question: str, decision: str | None = None) -> bool:
