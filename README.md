@@ -230,7 +230,9 @@ cp .env.example .env
 | `AGENT_MODE` | `pipeline` | `pipeline` 或 `tools` |
 | `AGENT_API_TOKEN` | 空 | 设置后 /api 需带 `X-Agent-Token` |
 | `AGENT_REQUIRE_TOKEN` | `false` | true 且未配 token 时直接拒绝所有 /api 请求 |
-| `AGENT_STORE` | `memory` | `memory`（单 worker）或 `sqlite`（多 worker） |
+| `AGENT_STORE` | `memory` | 会话/短期记忆后端：`memory`（单 worker）、`sqlite`（多 worker 共享）或 `mongodb`（存 MongoDB，集合自动创建） |
+| `AGENT_STORE_MONGODB_URI` | 空 | `AGENT_STORE=mongodb` 的连接串；空则回退 `AGENT_MONGODB_URI` |
+| `AGENT_STORE_MONGODB_DATABASE` | `metabase_agent_sessions` | MongoDB 会话库名 |
 | `AGENT_STATE_PATH` | `.metabase_agent_state.json` | 审批/表上下文文件；sqlite 模式指向 `.db` |
 | `AGENT_MEMORY_PATH` | `.metabase_agent_memory.json` | 会话记忆文件（memory 后端） |
 | `AGENT_SESSION_TTL_SECONDS` | `0` | 会话过期秒数，0=不过期（仅 sqlite） |
@@ -247,6 +249,7 @@ cp .env.example .env
 | `AGENT_MEMORY_COLLECTION` | `agent_memories` | 长期记忆集合 |
 | `AGENT_PGVECTOR_DSN` | 空 | pgvector PostgreSQL DSN |
 | `AGENT_PGVECTOR_TABLE` | `memory_embeddings` | pgvector 表名 |
+| `AGENT_PGVECTOR_AUTO_CREATE` | `true` | 启动时自动建库/扩展/表/索引（需建库权限）；false 则手动跑 `scripts/init_pgvector_memory.py` |
 | `AGENT_EMBEDDING_PROVIDER` | `hash` | `hash`（离线/测试）、`openai` 或 `siliconflow` |
 | `AGENT_EMBEDDING_MODEL` | `text-embedding-3-small` | embedding 模型；SiliconFlow 可用 `BAAI/bge-m3` |
 | `AGENT_EMBEDDING_DIMENSIONS` | `1536` | embedding 维度；pgvector 表也必须使用相同维度 |
@@ -316,7 +319,8 @@ docker run --env-file .env -p 8765:8765 -v metabase-agent-data:/app/data metabas
 
 - `.env` 只放服务器本地，不提交 git；Metabase Key 用只读权限；入口设 `AGENT_API_TOKEN`（生产建议 `AGENT_REQUIRE_TOKEN=true`）。
 - **单 worker（默认）**：`AGENT_STORE=memory`，状态在进程内 + 本地 JSON。
-- **多 worker**：设 `AGENT_STORE=sqlite`，`AGENT_STATE_PATH` 指向共享 `.db`（如 `/var/lib/metabase-agent/state.db`），各 worker 经 SQLite（WAL）共享会话/审批/表上下文；可选 `AGENT_SESSION_TTL_SECONDS` 清理过期会话。
+- **多 worker（单机）**：设 `AGENT_STORE=sqlite`，`AGENT_STATE_PATH` 指向共享 `.db`（如 `/var/lib/metabase-agent/state.db`），各 worker 经 SQLite（WAL）共享会话/审批/表上下文；可选 `AGENT_SESSION_TTL_SECONDS` 清理过期会话。
+- **跨主机多副本**：设 `AGENT_STORE=mongodb` + `AGENT_STORE_MONGODB_URI`，会话/审批/表上下文存 MongoDB（集合与索引自动创建，审批 `claim` 为原子 take-once）；tools 模式的短期记忆走这条即可跨副本共享。
 
 ---
 
@@ -334,7 +338,7 @@ docker run --env-file .env -p 8765:8765 -v metabase-agent-data:/app/data metabas
 - **多用户鉴权**：当前是单一共享 `AGENT_API_TOKEN`，持 token 者可读写任意 session 与任意 tenant/user 的长期记忆；多用户场景需要把身份绑定到凭证（per-tenant token 或接入认证系统），禁止请求体直接指定 tenant_id/user_id。
 - **只读校验的纵深防御**：应用层校验是手写词法器，建议生产侧同时用只读 BigQuery 服务账号 + `maximum_bytes_billed`，或引入 `sqlglot` 做 AST 级断言。
 - **长期记忆**：已加入 MongoDB 结构化 memory repository、pgvector 向量索引接口、skills 解析注入；默认关闭长期记忆，详见 `docs/memory-skills-implementation.md`。
-- **pgvector 初始化**：启用长期记忆前先设置 `AGENT_PGVECTOR_DSN`，再运行 `uv run python scripts/init_pgvector_memory.py` 建表和索引。
+- **pgvector 初始化**：默认 `AGENT_PGVECTOR_AUTO_CREATE=true`，启动时自动建库/扩展/表/索引（连接账号需有建库权限）；也可手动 `uv run python scripts/init_pgvector_memory.py`。启用后跑 `uv run metabase-agent ping` 会额外自检 `memory.mongodb / memory.embedding / memory.pgvector` 是否连通，避免"配了不生效"。
 
 ---
 

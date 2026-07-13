@@ -19,7 +19,7 @@ from metabase_agent.agent.graph import build_graph
 from metabase_agent.agent.sql_review import program_fingerprint
 from metabase_agent.agent.tool_loop import LoopOutcome, iter_tool_loop
 from metabase_agent.agent.tools import AgentTools
-from metabase_agent.api.store import SqliteStore
+from metabase_agent.api.store import MongoSessionStore, SessionStore, SqliteStore
 from metabase_agent.config.settings import Settings, get_settings
 from metabase_agent.memory import (
     MemoryManager,
@@ -40,20 +40,31 @@ MEMORY_LOADED = False
 STATE_LOADED = False
 _STATE_LOCK = threading.RLock()  # guards the in-memory dicts and on-disk writes
 _GRAPH_CACHE: dict[str, Any] = {}  # compiled graph reused across requests
-_SQLITE_STORE: dict[str, SqliteStore] = {}
+_SQLITE_STORE: dict[str, SessionStore] = {}
 _MEMORY_MANAGER_CACHE: dict[tuple[Any, ...], MemoryManager] = {}
 _SKILL_REGISTRY_CACHE: dict[tuple[Any, ...], SkillRegistry] = {}
 _CHECKPOINTER_CACHE: dict[tuple[Any, ...], Any] = {}
 
 
-def _active_store() -> SqliteStore | None:
+def _active_store() -> SessionStore | None:
     settings = get_settings()
-    if settings.agent_store != "sqlite":
+    if settings.agent_store == "sqlite":
+        key = f"sqlite:{settings.agent_state_path}"
+        store = _SQLITE_STORE.get(key)
+        if store is None:
+            store = SqliteStore(settings.agent_state_path)
+            _SQLITE_STORE[key] = store
+    elif settings.agent_store == "mongodb":
+        uri = settings.agent_store_mongodb_uri or settings.agent_mongodb_uri
+        if not uri:
+            raise RuntimeError("AGENT_STORE=mongodb requires AGENT_STORE_MONGODB_URI or AGENT_MONGODB_URI")
+        key = f"mongodb:{uri}:{settings.agent_store_mongodb_database}"
+        store = _SQLITE_STORE.get(key)
+        if store is None:
+            store = MongoSessionStore(uri, database=settings.agent_store_mongodb_database)
+            _SQLITE_STORE[key] = store
+    else:
         return None
-    store = _SQLITE_STORE.get(settings.agent_state_path)
-    if store is None:
-        store = SqliteStore(settings.agent_state_path)
-        _SQLITE_STORE[settings.agent_state_path] = store
     store.purge_expired(settings.agent_session_ttl_seconds)
     return store
 

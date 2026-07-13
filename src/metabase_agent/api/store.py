@@ -11,7 +11,7 @@ import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, messages TEXT NOT NULL, updated REAL NOT NULL);
@@ -20,6 +20,114 @@ CREATE TABLE IF NOT EXISTS table_context (session_id TEXT PRIMARY KEY, data TEXT
 """
 
 _PURGE_INTERVAL_SECONDS = 60.0
+
+
+class SessionStore(Protocol):
+    """Shared contract for the multi-worker session backends (sqlite / mongodb)."""
+
+    def history(self, session_id: str) -> list[dict[str, str]]: ...
+    def append_message(self, session_id: str, role: str, content: str, max_messages: int) -> list[dict[str, str]]: ...
+    def get_approval(self, session_id: str) -> dict[str, Any] | None: ...
+    def set_approval(self, session_id: str, data: dict[str, Any]) -> None: ...
+    def pop_approval(self, session_id: str) -> None: ...
+    def claim_approval(self, session_id: str) -> dict[str, Any] | None: ...
+    def get_table_context(self, session_id: str) -> dict[str, Any] | None: ...
+    def set_table_context(self, session_id: str, data: dict[str, Any]) -> None: ...
+    def pop_table_context(self, session_id: str) -> None: ...
+    def purge_expired(self, ttl_seconds: float) -> None: ...
+
+
+class MongoSessionStore:
+    """MongoDB-backed session store for tools-mode short-term memory.
+
+    Stores conversation history, pending SQL approvals and table context in
+    MongoDB so multiple workers (and restarts) share them. Collections and
+    indexes are created automatically on first use — no manual DB setup.
+    """
+
+    def __init__(self, uri: str, *, database: str, client: Any | None = None) -> None:
+        if client is None:
+            try:
+                from pymongo import MongoClient
+            except ImportError as exc:  # pragma: no cover - only without optional dependency.
+                raise RuntimeError("pymongo is required for MongoSessionStore") from exc
+            client = MongoClient(uri)
+        self._client = client
+        db = self._client[database]
+        self._sessions = db["sessions"]
+        self._approvals = db["approvals"]
+        self._table_context = db["table_context"]
+        # updated index backs TTL-style purge (1 == pymongo.ASCENDING); Mongo
+        # creates the collections lazily on first write.
+        for collection in (self._sessions, self._approvals, self._table_context):
+            collection.create_index([("updated", 1)])
+        self._last_purge = 0.0
+
+    def ping(self) -> None:
+        self._client.admin.command("ping")
+
+    def history(self, session_id: str) -> list[dict[str, str]]:
+        doc = self._sessions.find_one({"_id": session_id})
+        messages = doc.get("messages") if isinstance(doc, dict) else None
+        return messages if isinstance(messages, list) else []
+
+    def append_message(self, session_id: str, role: str, content: str, max_messages: int) -> list[dict[str, str]]:
+        # $push + $slice trims to the last max_messages atomically in one write.
+        doc = self._sessions.find_one_and_update(
+            {"_id": session_id},
+            {
+                "$push": {"messages": {"$each": [{"role": role, "content": content}], "$slice": -max_messages}},
+                "$set": {"updated": time.time()},
+            },
+            upsert=True,
+            return_document=True,
+        )
+        messages = doc.get("messages") if isinstance(doc, dict) else None
+        return messages if isinstance(messages, list) else []
+
+    def get_approval(self, session_id: str) -> dict[str, Any] | None:
+        return self._get(self._approvals, session_id)
+
+    def set_approval(self, session_id: str, data: dict[str, Any]) -> None:
+        self._set(self._approvals, session_id, data)
+
+    def pop_approval(self, session_id: str) -> None:
+        self._approvals.delete_one({"_id": session_id})
+
+    def claim_approval(self, session_id: str) -> dict[str, Any] | None:
+        doc = self._approvals.find_one_and_delete({"_id": session_id})
+        return self._payload(doc)
+
+    def get_table_context(self, session_id: str) -> dict[str, Any] | None:
+        return self._get(self._table_context, session_id)
+
+    def set_table_context(self, session_id: str, data: dict[str, Any]) -> None:
+        self._set(self._table_context, session_id, data)
+
+    def pop_table_context(self, session_id: str) -> None:
+        self._table_context.delete_one({"_id": session_id})
+
+    def purge_expired(self, ttl_seconds: float) -> None:
+        if ttl_seconds <= 0:
+            return
+        now = time.time()
+        if now - self._last_purge < min(_PURGE_INTERVAL_SECONDS, ttl_seconds):
+            return
+        self._last_purge = now
+        cutoff = now - ttl_seconds
+        for collection in (self._sessions, self._approvals, self._table_context):
+            collection.delete_many({"updated": {"$lt": cutoff}})
+
+    def _get(self, collection: Any, session_id: str) -> dict[str, Any] | None:
+        return self._payload(collection.find_one({"_id": session_id}))
+
+    def _set(self, collection: Any, session_id: str, data: dict[str, Any]) -> None:
+        collection.replace_one({"_id": session_id}, {"_id": session_id, "data": data, "updated": time.time()}, upsert=True)
+
+    @staticmethod
+    def _payload(doc: Any) -> dict[str, Any] | None:
+        data = doc.get("data") if isinstance(doc, dict) else None
+        return data if isinstance(data, dict) else None
 
 
 class SqliteStore:

@@ -91,6 +91,9 @@ class VectorIndex(Protocol):
 
 
 class NullVectorIndex:
+    def ping(self) -> None:
+        return None
+
     def upsert(self, record: MemoryRecord, embedding: Sequence[float]) -> None:
         return None
 
@@ -101,6 +104,9 @@ class NullVectorIndex:
 class InMemoryVectorIndex:
     def __init__(self) -> None:
         self._items: dict[str, tuple[MemoryRecord, list[float]]] = {}
+
+    def ping(self) -> None:
+        return None
 
     def upsert(self, record: MemoryRecord, embedding: Sequence[float]) -> None:
         self._items[record.id] = (record, list(embedding))
@@ -117,8 +123,40 @@ class InMemoryVectorIndex:
         return [record_id for score, record_id in scored[:limit] if score > 0]
 
 
+def pgvector_ddl_statements(table: str, dimensions: int) -> list[str]:
+    """Idempotent DDL for the memory-embeddings table, its extension and indexes.
+
+    Shared by the init script and the in-code auto-create path so they can
+    never drift.
+    """
+    table = _validate_identifier(table)
+    vector_index = _validate_identifier(f"{table}_vector_idx")
+    filter_index = _validate_identifier(f"{table}_filter_idx")
+    return [
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+          id text PRIMARY KEY,
+          tenant_id text NOT NULL,
+          user_id text NOT NULL,
+          scope text NOT NULL,
+          memory_type text NOT NULL,
+          memory_id text NOT NULL,
+          content text NOT NULL,
+          embedding vector({int(dimensions)}) NOT NULL,
+          metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+          status text NOT NULL,
+          created_at timestamptz NOT NULL,
+          updated_at timestamptz NOT NULL
+        )
+        """,
+        f"CREATE INDEX IF NOT EXISTS {vector_index} ON {table} USING hnsw (embedding vector_cosine_ops)",
+        f"CREATE INDEX IF NOT EXISTS {filter_index} ON {table} (tenant_id, user_id, memory_type, status)",
+    ]
+
+
 class PgVectorIndex:
-    def __init__(self, dsn: str, *, table: str = "memory_embeddings") -> None:
+    def __init__(self, dsn: str, *, table: str = "memory_embeddings", dimensions: int = 1536, auto_create: bool = False) -> None:
         try:
             import psycopg
             from psycopg.types.json import Json
@@ -128,6 +166,49 @@ class PgVectorIndex:
         self._json = Json
         self._dsn = dsn
         self._table = _validate_identifier(table)
+        self._dimensions = dimensions
+        if auto_create:
+            self.ensure_schema()
+
+    def ensure_schema(self) -> None:
+        """Create the database (best-effort), extension, table and indexes if missing.
+
+        So enabling long-term memory doesn't require a separate manual
+        `init_pgvector_memory.py` run.
+        """
+        self._ensure_database()
+        with self._psycopg.connect(self._dsn) as conn:
+            for statement in pgvector_ddl_statements(self._table, self._dimensions):
+                conn.execute(statement)
+
+    def _ensure_database(self) -> None:
+        """Create the target Postgres database if it does not exist.
+
+        Postgres never auto-creates databases, so we connect to the `postgres`
+        maintenance DB and issue CREATE DATABASE. Best-effort: needs CREATEDB
+        privilege; on failure the caller surfaces a clear error via ping().
+        """
+        try:
+            with self._psycopg.connect(self._dsn):
+                return
+        except self._psycopg.OperationalError as exc:
+            if "does not exist" not in str(exc).lower():
+                raise  # server unreachable / auth error — not a missing-db case
+        info = self._psycopg.conninfo.conninfo_to_dict(self._dsn)
+        dbname = info.get("dbname")
+        if not dbname:
+            return
+        maintenance = self._psycopg.conninfo.make_conninfo(**{**info, "dbname": "postgres"})
+        with self._psycopg.connect(maintenance, autocommit=True) as conn:
+            exists = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (dbname,)).fetchone()
+            if not exists:
+                conn.execute(f'CREATE DATABASE "{dbname}"')
+
+    def ping(self) -> None:
+        # Verifies both connectivity AND that the table exists (missing table
+        # is the most common silent long-term-memory failure).
+        with self._psycopg.connect(self._dsn) as conn:
+            conn.execute(f"SELECT 1 FROM {self._table} LIMIT 1")
 
     def upsert(self, record: MemoryRecord, embedding: Sequence[float]) -> None:
         vector = _pg_vector_literal(embedding)

@@ -85,7 +85,17 @@ def ping() -> None:
 
 
 def run_ping_checks(settings: Settings) -> list[tuple[str, bool, str]]:
-    return [_ping_metabase(settings), _ping_openai(settings)]
+    checks = [_ping_metabase(settings), _ping_openai(settings)]
+    if settings.agent_long_term_memory_enabled:
+        checks.extend(_ping_memory(settings))
+    return checks
+
+
+def _ping_memory(settings: Settings) -> list[tuple[str, bool, str]]:
+    try:
+        return build_memory_manager(settings).health_check()
+    except Exception as exc:
+        return [("memory", False, f"init failed: {type(exc).__name__}: {exc}")]
 
 
 def _cli_contexts(settings: Settings, question: str) -> tuple[str, str, str, str]:

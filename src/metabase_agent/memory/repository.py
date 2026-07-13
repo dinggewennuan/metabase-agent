@@ -39,6 +39,9 @@ class MemoryRepository(Protocol):
 
 
 class NullMemoryRepository:
+    def ping(self) -> None:
+        return None
+
     def get_by_id(self, record_id: str) -> MemoryRecord | None:
         return None
 
@@ -72,6 +75,9 @@ class InMemoryMemoryRepository:
         self._by_namespace_key: dict[tuple[tuple[str, ...], str], str] = {}
         for record in records or []:
             self.put(record)
+
+    def ping(self) -> None:
+        return None
 
     def get_by_id(self, record_id: str) -> MemoryRecord | None:
         return self._by_id.get(record_id)
@@ -144,6 +150,9 @@ class MongoMemoryRepository:
         self._collection.create_index([("namespace_path", ASCENDING), ("key", ASCENDING)], unique=True)
         self._collection.create_index([("id", ASCENDING)], unique=True)
         self._collection.create_index([("tenant_id", ASCENDING), ("user_id", ASCENDING), ("memory_type", ASCENDING), ("status", ASCENDING)])
+
+    def ping(self) -> None:
+        self._client.admin.command("ping")
 
     def get_by_id(self, record_id: str) -> MemoryRecord | None:
         payload = self._collection.find_one({"id": record_id})

@@ -307,3 +307,54 @@ def test_build_memory_manager_wires_llm_extractor_by_flag() -> None:
     assert without_flag.llm_extractor is None
     assert with_flag.llm_extractor is not None
     assert no_key.llm_extractor is None
+
+
+def test_pgvector_ddl_statements_use_configured_dimensions() -> None:
+    from metabase_agent.memory.vector import pgvector_ddl_statements
+
+    statements = pgvector_ddl_statements("memory_embeddings", 1024)
+
+    assert statements[0] == "CREATE EXTENSION IF NOT EXISTS vector"
+    assert "vector(1024)" in statements[1]
+    assert "memory_embeddings_vector_idx" in statements[2]
+    assert "memory_embeddings_filter_idx" in statements[3]
+
+
+def test_pgvector_ddl_rejects_bad_identifier() -> None:
+    import pytest
+
+    from metabase_agent.memory.vector import pgvector_ddl_statements
+
+    with pytest.raises(ValueError):
+        pgvector_ddl_statements("memory_embeddings; DROP TABLE x", 1536)
+
+
+def test_health_check_reports_unconfigured_backends() -> None:
+    from metabase_agent.memory.repository import NullMemoryRepository
+    from metabase_agent.memory.vector import NullVectorIndex
+
+    manager = MemoryManager(NullMemoryRepository(), NullVectorIndex(), HashEmbeddingProvider(64))
+
+    checks = dict((name, (ok, detail)) for name, ok, detail in manager.health_check())
+
+    assert checks["memory.mongodb"][0] is False
+    assert "AGENT_MONGODB_URI" in checks["memory.mongodb"][1]
+    assert checks["memory.pgvector"][0] is False
+    assert "AGENT_PGVECTOR_DSN" in checks["memory.pgvector"][1]
+    # Embedding always works (hash provider), reporting its dimension.
+    assert checks["memory.embedding"][0] is True
+    assert "dim=64" in checks["memory.embedding"][1]
+
+
+def test_health_check_probes_wired_backends() -> None:
+    class _OkRepo(InMemoryMemoryRepository):
+        pass
+
+    class _OkVector(InMemoryVectorIndex):
+        pass
+
+    manager = MemoryManager(_OkRepo(), _OkVector(), HashEmbeddingProvider(64))
+
+    checks = dict((name, ok) for name, ok, _detail in manager.health_check())
+
+    assert checks == {"memory.mongodb": True, "memory.embedding": True, "memory.pgvector": True}

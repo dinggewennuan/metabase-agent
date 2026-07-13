@@ -51,6 +51,36 @@ class MemoryManager:
         self.embedding_provider = embedding_provider
         self.llm_extractor = llm_extractor
 
+    def health_check(self) -> list[tuple[str, bool, str]]:
+        """Probe every long-term-memory backend so `ping` can report OK/FAIL.
+
+        Turns the usual silent no-op ("enabled but nothing persists") into a
+        concrete diagnosis: which of Mongo / embedding / pgvector is broken.
+        """
+        results: list[tuple[str, bool, str]] = []
+        if isinstance(self.repository, NullMemoryRepository):
+            results.append(("memory.mongodb", False, "not configured (set AGENT_MONGODB_URI)"))
+        else:
+            try:
+                self.repository.ping()
+                results.append(("memory.mongodb", True, "connected"))
+            except Exception as exc:
+                results.append(("memory.mongodb", False, f"{type(exc).__name__}: {exc}"))
+        try:
+            vector = self.embedding_provider.embed("healthcheck probe")
+            results.append(("memory.embedding", True, f"{type(self.embedding_provider).__name__} dim={len(vector)}"))
+        except Exception as exc:
+            results.append(("memory.embedding", False, f"{type(exc).__name__}: {exc}"))
+        if isinstance(self.vector_index, NullVectorIndex):
+            results.append(("memory.pgvector", False, "not configured (set AGENT_PGVECTOR_DSN)"))
+        else:
+            try:
+                self.vector_index.ping()
+                results.append(("memory.pgvector", True, "table reachable"))
+            except Exception as exc:
+                results.append(("memory.pgvector", False, f"{type(exc).__name__}: {exc}"))
+        return results
+
     def load_context(self, *, tenant_id: str, user_id: str, query: str, limit: int = 5) -> MemoryContext:
         semantic_ns = user_namespace(tenant_id, user_id, MemoryType.SEMANTIC)
         procedural_ns = user_namespace(tenant_id, user_id, MemoryType.PROCEDURAL)
@@ -330,7 +360,12 @@ def build_memory_manager(settings: Settings) -> MemoryManager:
 
     vector_index: VectorIndex = NullVectorIndex()
     if settings.agent_pgvector_dsn:
-        vector_index = PgVectorIndex(settings.agent_pgvector_dsn, table=settings.agent_pgvector_table)
+        vector_index = PgVectorIndex(
+            settings.agent_pgvector_dsn,
+            table=settings.agent_pgvector_table,
+            dimensions=settings.agent_embedding_dimensions,
+            auto_create=settings.agent_pgvector_auto_create,
+        )
 
     embedding_provider: EmbeddingProvider
     if settings.agent_embedding_provider == "openai":
