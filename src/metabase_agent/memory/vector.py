@@ -64,16 +64,21 @@ class SiliconFlowEmbeddingProvider:
         self._dimensions = settings.agent_embedding_dimensions
 
     def embed(self, text: str) -> list[float]:
-        response = httpx.post(
-            f"{self._base_url}/embeddings",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"input": text, "model": self._model},
-            timeout=self._timeout,
-        )
-        response.raise_for_status()
+        body: dict[str, Any] = {"input": text, "model": self._model}
+        if self._dimensions > 0:
+            # MRL models (Qwen3-Embedding family, ~4096 native dims) must be
+            # asked for the configured dimension: pgvector's HNSW index caps
+            # at 2000 dims, so the native size can never be stored as-is.
+            body["dimensions"] = self._dimensions
+        try:
+            response = self._post_embeddings(body)
+        except httpx.HTTPStatusError:
+            if "dimensions" not in body:
+                raise
+            # Fixed-dimension models (e.g. BAAI/bge-m3) may reject the
+            # dimensions param — retry without it; the output is then length-
+            # checked against the configured dimension anyway.
+            response = self._post_embeddings({"input": text, "model": self._model})
         payload = response.json()
         data = payload.get("data")
         if not isinstance(data, list) or not data:
@@ -82,6 +87,22 @@ class SiliconFlowEmbeddingProvider:
         if not isinstance(first, dict) or not isinstance(first.get("embedding"), list):
             raise RuntimeError("invalid SiliconFlow embedding response")
         return _check_dimensions([float(value) for value in first["embedding"]], self._dimensions)
+
+    def _post_embeddings(self, body: dict[str, Any]) -> httpx.Response:
+        response = httpx.post(
+            f"{self._base_url}/embeddings",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+                # Never send httpx's default "python-httpx/x.y" UA: it is a
+                # stock WAF block rule (the same one that 403'd the LLM gateway).
+                "User-Agent": "metabase-agent/0.1",
+            },
+            json=body,
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        return response
 
 
 class VectorIndex(Protocol):

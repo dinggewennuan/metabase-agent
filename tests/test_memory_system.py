@@ -124,9 +124,45 @@ def test_siliconflow_embedding_provider_uses_configured_api(monkeypatch) -> None
 
     assert embedding == [0.1, 0.2, 0.3]
     assert captured["url"] == "https://api.siliconflow.cn/v1/embeddings"
-    assert captured["headers"] == {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
-    assert captured["json"] == {"input": "Hello, world!", "model": "BAAI/bge-m3"}
+    assert captured["headers"] == {"Authorization": "Bearer test-key", "Content-Type": "application/json", "User-Agent": "metabase-agent/0.1"}
+    assert "python" not in captured["headers"]["User-Agent"].lower()
+    # MRL-capable models are asked for the configured dimension explicitly.
+    assert captured["json"] == {"input": "Hello, world!", "model": "BAAI/bge-m3", "dimensions": 3}
     assert captured["timeout"] == 12
+
+
+def test_siliconflow_embedding_retries_without_dimensions_param(monkeypatch) -> None:
+    import httpx
+
+    attempts: list[dict[str, object]] = []
+
+    class Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "https://api.siliconflow.cn/v1/embeddings")
+                raise httpx.HTTPStatusError("bad request", request=request, response=httpx.Response(self.status_code, request=request))
+
+        def json(self) -> dict[str, object]:
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    def fake_post(url: str, *, headers, json, timeout) -> Response:
+        attempts.append(json)
+        # Fixed-dimension models reject the MRL dimensions param.
+        return Response(400 if "dimensions" in json else 200)
+
+    monkeypatch.setattr("metabase_agent.memory.vector.httpx.post", fake_post)
+    provider = SiliconFlowEmbeddingProvider(
+        Settings(SILICONFLOW_API_KEY="test-key", AGENT_EMBEDDING_MODEL="BAAI/bge-m3", AGENT_EMBEDDING_DIMENSIONS=3)
+    )
+
+    embedding = provider.embed("Hello, world!")
+
+    assert embedding == [0.1, 0.2, 0.3]
+    assert len(attempts) == 2
+    assert "dimensions" not in attempts[1]
 
 
 def test_siliconflow_embedding_provider_rejects_dimension_mismatch(monkeypatch) -> None:
