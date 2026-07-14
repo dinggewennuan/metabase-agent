@@ -56,6 +56,11 @@ class OpenAIEmbeddingProvider:
         return _check_dimensions(list(response.data[0].embedding), self._dimensions)
 
 
+# Models with a FIXED output dimension reject the MRL `dimensions` param with
+# a 400; known families are skipped outright so no request is wasted probing.
+_FIXED_DIMENSION_MODEL_PREFIXES = ("baai/bge-", "netease-youdao/bce-")
+
+
 class SiliconFlowEmbeddingProvider:
     def __init__(self, settings: Settings) -> None:
         if not settings.siliconflow_api_key:
@@ -65,9 +70,10 @@ class SiliconFlowEmbeddingProvider:
         self._model = settings.agent_embedding_model
         self._timeout = settings.openai_timeout
         self._dimensions = settings.agent_embedding_dimensions
-        # Flips to False once the model rejects the MRL dimensions param, so
-        # fixed-dimension models (bge-m3) don't pay a 400 on every embed.
-        self._send_dimensions = True
+        # For unknown models this starts True and flips to False on the first
+        # rejection (one probe per process); known fixed-dimension families
+        # never probe at all.
+        self._send_dimensions = not self._model.lower().startswith(_FIXED_DIMENSION_MODEL_PREFIXES)
 
     def embed(self, text: str) -> list[float]:
         body: dict[str, Any] = {"input": text, "model": self._model}

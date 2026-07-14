@@ -129,8 +129,9 @@ def test_siliconflow_embedding_provider_uses_configured_api(monkeypatch) -> None
     assert captured["url"] == "https://api.siliconflow.cn/v1/embeddings"
     assert captured["headers"] == {"Authorization": "Bearer test-key", "Content-Type": "application/json", "User-Agent": "metabase-agent/0.1"}
     assert "python" not in captured["headers"]["User-Agent"].lower()
-    # MRL-capable models are asked for the configured dimension explicitly.
-    assert captured["json"] == {"input": "Hello, world!", "model": "BAAI/bge-m3", "dimensions": 3}
+    # bge-m3 is a known fixed-dimension model: the MRL dimensions param is
+    # never sent, so there is no wasted 400 probe per process.
+    assert captured["json"] == {"input": "Hello, world!", "model": "BAAI/bge-m3"}
     assert captured["timeout"] == 12
 
 
@@ -160,7 +161,7 @@ def test_siliconflow_embedding_retries_without_dimensions_param(monkeypatch) -> 
 
     monkeypatch.setattr("metabase_agent.memory.vector.httpx.post", fake_post)
     provider = SiliconFlowEmbeddingProvider(
-        Settings(SILICONFLOW_API_KEY="test-key", AGENT_EMBEDDING_MODEL="BAAI/bge-m3", AGENT_EMBEDDING_DIMENSIONS=3)
+        Settings(SILICONFLOW_API_KEY="test-key", AGENT_EMBEDDING_MODEL="Some/Unknown-Embedding", AGENT_EMBEDDING_DIMENSIONS=3)
     )
 
     embedding = provider.embed("Hello, world!")
@@ -449,7 +450,7 @@ def test_siliconflow_dimensions_rejection_is_remembered(monkeypatch) -> None:
 
     monkeypatch.setattr("metabase_agent.memory.vector.httpx.post", fake_post)
     provider = SiliconFlowEmbeddingProvider(
-        Settings(SILICONFLOW_API_KEY="test-key", AGENT_EMBEDDING_MODEL="BAAI/bge-m3", AGENT_EMBEDDING_DIMENSIONS=3)
+        Settings(SILICONFLOW_API_KEY="test-key", AGENT_EMBEDDING_MODEL="Some/Unknown-Embedding", AGENT_EMBEDDING_DIMENSIONS=3)
     )
 
     provider.embed("first")
@@ -459,6 +460,36 @@ def test_siliconflow_dimensions_rejection_is_remembered(monkeypatch) -> None:
     # Second embed: the rejection is remembered — exactly 1 request, no 400.
     assert len(attempts) == 3
     assert "dimensions" not in attempts[2]
+
+
+def test_siliconflow_known_fixed_dimension_models_never_probe(monkeypatch) -> None:
+    attempts: list[dict[str, object]] = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    def fake_post(url: str, *, headers, json, timeout) -> Response:
+        attempts.append(json)
+        return Response()
+
+    monkeypatch.setattr("metabase_agent.memory.vector.httpx.post", fake_post)
+    provider = SiliconFlowEmbeddingProvider(
+        Settings(SILICONFLOW_API_KEY="test-key", AGENT_EMBEDDING_MODEL="BAAI/bge-m3", AGENT_EMBEDDING_DIMENSIONS=3)
+    )
+
+    provider.embed("first")
+    provider.embed("second")
+
+    # No probing 400s at all: every request goes straight through without the param.
+    assert len(attempts) == 2
+    assert all("dimensions" not in body for body in attempts)
 
 
 def test_pgvector_ensure_schema_recreates_on_dimension_mismatch() -> None:
