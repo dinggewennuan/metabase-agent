@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
 from collections.abc import Sequence
@@ -11,6 +12,8 @@ from openai import OpenAI
 
 from metabase_agent.config.settings import Settings
 from metabase_agent.memory.models import MemoryRecord
+
+_LOGGER = logging.getLogger("metabase_agent")
 
 
 class EmbeddingProvider(Protocol):
@@ -101,6 +104,11 @@ class SiliconFlowEmbeddingProvider:
             json=body,
             timeout=self._timeout,
         )
+        if response.status_code >= 400:
+            # The provider's error body names the actual cause (invalid key /
+            # real-name verification / model permission / region block) —
+            # without it a 403 is undebuggable from the status line alone.
+            _LOGGER.warning("siliconflow embeddings HTTP %s: %s", response.status_code, response.text[:300])
         response.raise_for_status()
         return response
 

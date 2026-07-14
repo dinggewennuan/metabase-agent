@@ -100,6 +100,9 @@ def test_siliconflow_embedding_provider_uses_configured_api(monkeypatch) -> None
     captured: dict[str, object] = {}
 
     class Response:
+        status_code = 200
+        text = ""
+
         def raise_for_status(self) -> None:
             return None
 
@@ -137,6 +140,8 @@ def test_siliconflow_embedding_retries_without_dimensions_param(monkeypatch) -> 
     attempts: list[dict[str, object]] = []
 
     class Response:
+        text = "model does not support dimensions"
+
         def __init__(self, status_code: int) -> None:
             self.status_code = status_code
 
@@ -167,6 +172,9 @@ def test_siliconflow_embedding_retries_without_dimensions_param(monkeypatch) -> 
 
 def test_siliconflow_embedding_provider_rejects_dimension_mismatch(monkeypatch) -> None:
     class Response:
+        status_code = 200
+        text = ""
+
         def raise_for_status(self) -> None:
             return None
 
