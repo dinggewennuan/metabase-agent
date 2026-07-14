@@ -422,3 +422,137 @@ def test_episodic_event_content_is_truncated() -> None:
     event = next(record for record in records if record.key.startswith("event.analysis."))
     assert len(event.content) < 700
     assert len(str(event.value["answer"])) <= 400
+
+
+def test_siliconflow_dimensions_rejection_is_remembered(monkeypatch) -> None:
+    import httpx as _httpx
+
+    attempts: list[dict[str, object]] = []
+
+    class Response:
+        text = "The parameter is invalid."
+
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = _httpx.Request("POST", "https://api.siliconflow.cn/v1/embeddings")
+                raise _httpx.HTTPStatusError("bad request", request=request, response=_httpx.Response(self.status_code, request=request))
+
+        def json(self) -> dict[str, object]:
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    def fake_post(url: str, *, headers, json, timeout) -> Response:
+        attempts.append(json)
+        return Response(400 if "dimensions" in json else 200)
+
+    monkeypatch.setattr("metabase_agent.memory.vector.httpx.post", fake_post)
+    provider = SiliconFlowEmbeddingProvider(
+        Settings(SILICONFLOW_API_KEY="test-key", AGENT_EMBEDDING_MODEL="BAAI/bge-m3", AGENT_EMBEDDING_DIMENSIONS=3)
+    )
+
+    provider.embed("first")
+    provider.embed("second")
+
+    # First embed: with-dimensions attempt (400) + fallback = 2 requests.
+    # Second embed: the rejection is remembered — exactly 1 request, no 400.
+    assert len(attempts) == 3
+    assert "dimensions" not in attempts[2]
+
+
+def test_pgvector_ensure_schema_recreates_on_dimension_mismatch() -> None:
+    from metabase_agent.memory.vector import PgVectorIndex
+
+    executed: list[str] = []
+
+    class _FakeCursorResult:
+        def __init__(self, row) -> None:
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _FakeConn:
+        def __init__(self, existing_dim: int) -> None:
+            self._existing_dim = existing_dim
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append(sql if isinstance(sql, str) else str(sql))
+            if "to_regclass" in sql and "atttypmod" not in sql:
+                return _FakeCursorResult(("memory_embeddings",))
+            if "atttypmod" in sql:
+                return _FakeCursorResult((self._existing_dim,))
+            return _FakeCursorResult(None)
+
+    class _FakePsycopg:
+        OperationalError = RuntimeError
+
+        @staticmethod
+        def connect(dsn, **kwargs):
+            return _FakeConn(existing_dim=1536)
+
+    index = PgVectorIndex.__new__(PgVectorIndex)
+    index._psycopg = _FakePsycopg()
+    index._json = dict
+    index._dsn = "postgresql://u:p@localhost/db"
+    index._table = "memory_embeddings"
+    index._dimensions = 1024
+
+    index.ensure_schema()
+
+    # Old 1536-dim table dropped, then recreated at the configured 1024.
+    assert any(sql.startswith("DROP TABLE memory_embeddings") for sql in executed)
+    assert any("vector(1024)" in sql for sql in executed)
+
+
+def test_pgvector_ensure_schema_keeps_matching_table() -> None:
+    from metabase_agent.memory.vector import PgVectorIndex
+
+    executed: list[str] = []
+
+    class _FakeCursorResult:
+        def __init__(self, row) -> None:
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append(sql if isinstance(sql, str) else str(sql))
+            if "to_regclass" in sql and "atttypmod" not in sql:
+                return _FakeCursorResult(("memory_embeddings",))
+            if "atttypmod" in sql:
+                return _FakeCursorResult((1024,))
+            return _FakeCursorResult(None)
+
+    class _FakePsycopg:
+        OperationalError = RuntimeError
+
+        @staticmethod
+        def connect(dsn, **kwargs):
+            return _FakeConn()
+
+    index = PgVectorIndex.__new__(PgVectorIndex)
+    index._psycopg = _FakePsycopg()
+    index._json = dict
+    index._dsn = "postgresql://u:p@localhost/db"
+    index._table = "memory_embeddings"
+    index._dimensions = 1024
+
+    index.ensure_schema()
+
+    assert not any(sql.startswith("DROP TABLE") for sql in executed)

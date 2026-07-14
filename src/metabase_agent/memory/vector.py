@@ -65,10 +65,13 @@ class SiliconFlowEmbeddingProvider:
         self._model = settings.agent_embedding_model
         self._timeout = settings.openai_timeout
         self._dimensions = settings.agent_embedding_dimensions
+        # Flips to False once the model rejects the MRL dimensions param, so
+        # fixed-dimension models (bge-m3) don't pay a 400 on every embed.
+        self._send_dimensions = True
 
     def embed(self, text: str) -> list[float]:
         body: dict[str, Any] = {"input": text, "model": self._model}
-        if self._dimensions > 0:
+        if self._dimensions > 0 and self._send_dimensions:
             # MRL models (Qwen3-Embedding family, ~4096 native dims) must be
             # asked for the configured dimension: pgvector's HNSW index caps
             # at 2000 dims, so the native size can never be stored as-is.
@@ -78,10 +81,13 @@ class SiliconFlowEmbeddingProvider:
         except httpx.HTTPStatusError:
             if "dimensions" not in body:
                 raise
-            # Fixed-dimension models (e.g. BAAI/bge-m3) may reject the
-            # dimensions param — retry without it; the output is then length-
-            # checked against the configured dimension anyway.
+            # Fixed-dimension models (e.g. BAAI/bge-m3) reject the dimensions
+            # param — retry without it and remember, so every later embed goes
+            # straight through instead of eating a 400 first. The output is
+            # still length-checked against the configured dimension.
             response = self._post_embeddings({"input": text, "model": self._model})
+            self._send_dimensions = False
+            _LOGGER.info("siliconflow model %s rejects the dimensions param; omitting it from now on", self._model)
         payload = response.json()
         data = payload.get("data")
         if not isinstance(data, list) or not data:
@@ -203,12 +209,39 @@ class PgVectorIndex:
         """Create the database (best-effort), extension, table and indexes if missing.
 
         So enabling long-term memory doesn't require a separate manual
-        `init_pgvector_memory.py` run.
+        `init_pgvector_memory.py` run. If the table exists with a DIFFERENT
+        vector dimension (e.g. created at 1536 before switching to a 1024-dim
+        model), it is dropped and recreated: the embeddings table is a
+        rebuildable index — MongoDB remains the memory source of truth.
         """
         self._ensure_database()
         with self._psycopg.connect(self._dsn) as conn:
+            existing = self._existing_dimensions(conn)
+            if existing is not None and existing != self._dimensions:
+                _LOGGER.warning(
+                    "pgvector table %s is vector(%s) but AGENT_EMBEDDING_DIMENSIONS=%s; "
+                    "dropping and recreating it (embeddings are derived data; MongoDB memory records are unaffected)",
+                    self._table,
+                    existing,
+                    self._dimensions,
+                )
+                conn.execute(f"DROP TABLE {self._table}")
             for statement in pgvector_ddl_statements(self._table, self._dimensions):
                 conn.execute(statement)
+
+    def _existing_dimensions(self, conn: Any) -> int | None:
+        """Declared vector dimension of the existing table, or None if absent."""
+        row = conn.execute("SELECT to_regclass(%s)", (self._table,)).fetchone()
+        if not row or row[0] is None:
+            return None
+        # For pgvector columns atttypmod IS the declared dimension.
+        dim_row = conn.execute(
+            "SELECT atttypmod FROM pg_attribute WHERE attrelid = to_regclass(%s) AND attname = 'embedding'",
+            (self._table,),
+        ).fetchone()
+        if not dim_row or not isinstance(dim_row[0], int) or dim_row[0] <= 0:
+            return None
+        return int(dim_row[0])
 
     def _ensure_database(self) -> None:
         """Create the target Postgres database if it does not exist.
