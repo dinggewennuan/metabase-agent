@@ -26,6 +26,20 @@
     .toggle { display: flex; align-items: center; gap: 8px; }
     .examples { display: grid; gap: 8px; }
     .example { text-align: left; background: rgba(31,35,40,.05); color: var(--ink); border: 1px solid transparent; padding: 10px 12px; font-weight: 650; }
+    .review-box { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--line); border-radius: 18px; background: rgba(255,255,255,.42); }
+    .review-head { display: flex; align-items: center; justify-content: space-between; }
+    .review-head h2 { margin: 0; }
+    .review-refresh { border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.62); color: var(--muted); padding: 3px 9px; font-size: 11px; font-weight: 800; }
+    .review-refresh:hover { color: var(--ink); background: rgba(255,255,255,.9); }
+    .review-empty { color: var(--muted); font-size: 12px; padding: 4px 2px; }
+    .review-item { border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: rgba(255,255,255,.55); display: grid; gap: 8px; }
+    .review-item .rule { font-size: 13px; line-height: 1.5; color: var(--ink); }
+    .review-item .meta { font-size: 11px; color: var(--muted); }
+    .review-actions { display: flex; gap: 6px; }
+    .review-actions button { border-radius: 10px; padding: 6px 10px; font-size: 12px; font-weight: 750; }
+    .review-actions .approve { background: var(--accent); color: #fff8ef; border: 1px solid var(--accent); }
+    .review-actions .reject { border: 1px solid var(--line); background: rgba(255,255,255,.72); color: var(--ink); }
+    .review-actions button:disabled { opacity: .55; cursor: wait; }
     .example:hover { border-color: var(--line); background: rgba(255,255,255,.62); }
     .suggestions { display: none; gap: 8px; margin-top: 12px; }
     .suggestions.visible { display: grid; }
@@ -125,6 +139,13 @@
         <button class="example" type="button">查询BigQuery-GA 下business_data都有什么表</button>
       </div>
       <div id="suggestions" class="suggestions"></div>
+      <div class="review-box" id="reviewBox" hidden>
+        <div class="review-head">
+          <h2>记忆审核</h2>
+          <button id="reviewRefresh" class="review-refresh" type="button">刷新</button>
+        </div>
+        <div id="reviewList"><div class="review-empty">加载中…</div></div>
+      </div>
       <p class="hint">提示：按 Enter 发送，Shift+Enter 换行。真实模式配置来自 .env，页面不会展示密钥。</p>
     </aside>
     <section class="panel chat-shell">
@@ -722,8 +743,99 @@
         status.textContent = `加载 session 失败：${error}`;
       }
     }
-    loadSession.addEventListener('click', loadHistory);
-    sessionInput.addEventListener('change', loadHistory);
+    loadSession.addEventListener('click', () => { loadHistory(); loadReview(); });
+    sessionInput.addEventListener('change', () => { loadHistory(); loadReview(); });
+
+    // Memory review: list pending_review procedural rules and approve/reject
+    // them via the existing /api/memories status endpoint. Procedural memory
+    // only takes effect (injected into the prompt) once set to active.
+    const reviewBox = document.getElementById('reviewBox');
+    const reviewList = document.getElementById('reviewList');
+    document.getElementById('reviewRefresh').addEventListener('click', loadReview);
+    function renderReviewEmpty(text) {
+      const div = document.createElement('div');
+      div.className = 'review-empty';
+      div.textContent = text;
+      reviewList.replaceChildren(div);
+    }
+    async function loadReview() {
+      const userId = currentSessionId();
+      const url = `/api/memories?user_id=${encodeURIComponent(userId)}&memory_type=procedural&status=pending_review&limit=50`;
+      let res;
+      try {
+        res = await fetch(url, {headers: authHeaders({})});
+      } catch (error) {
+        reviewBox.hidden = true;
+        return;
+      }
+      if (res.status === 400) {
+        // Long-term memory disabled — nothing to review, hide the panel.
+        reviewBox.hidden = true;
+        return;
+      }
+      reviewBox.hidden = false;
+      if (!res.ok) {
+        renderReviewEmpty(`加载失败（HTTP ${res.status}）`);
+        return;
+      }
+      const data = await res.json();
+      const memories = (data && data.memories) || [];
+      if (!memories.length) {
+        renderReviewEmpty('没有待审核的规则。');
+        return;
+      }
+      reviewList.replaceChildren(...memories.map(memory => renderReviewItem(memory, userId)));
+    }
+    function renderReviewItem(memory, userId) {
+      const item = document.createElement('div');
+      item.className = 'review-item';
+      const rule = document.createElement('div');
+      rule.className = 'rule';
+      rule.textContent = memory.content || '(空)';
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const conf = typeof memory.confidence === 'number' ? memory.confidence.toFixed(2) : memory.confidence;
+      meta.textContent = `置信度 ${conf} · 来源 ${memory.source || '—'} · ${(memory.created_at || '').slice(0, 19).replace('T', ' ')}`;
+      const actions = document.createElement('div');
+      actions.className = 'review-actions';
+      const approve = document.createElement('button');
+      approve.type = 'button';
+      approve.className = 'approve';
+      approve.textContent = '通过';
+      const reject = document.createElement('button');
+      reject.type = 'button';
+      reject.className = 'reject';
+      reject.textContent = '拒绝';
+      approve.addEventListener('click', () => decideReview(memory.id, userId, 'active', item, actions));
+      reject.addEventListener('click', () => decideReview(memory.id, userId, 'superseded', item, actions));
+      actions.append(approve, reject);
+      item.append(rule, meta, actions);
+      return item;
+    }
+    async function decideReview(memoryId, userId, newStatus, item, actions) {
+      actions.querySelectorAll('button').forEach(node => { node.disabled = true; });
+      try {
+        const res = await fetch(`/api/memories/${encodeURIComponent(memoryId)}/status`, {
+          method: 'POST',
+          headers: authHeaders({'Content-Type': 'application/json'}),
+          body: JSON.stringify({user_id: userId, status: newStatus}),
+        });
+        if (!res.ok) {
+          status.textContent = `操作失败（HTTP ${res.status}）`;
+          actions.querySelectorAll('button').forEach(node => { node.disabled = false; });
+          return;
+        }
+        item.remove();
+        status.textContent = newStatus === 'active' ? '规则已激活，将在后续对话生效。' : '规则已拒绝。';
+        if (!reviewList.querySelector('.review-item')) {
+          renderReviewEmpty('没有待审核的规则。');
+        }
+      } catch (error) {
+        status.textContent = `操作失败：${error}`;
+        actions.querySelectorAll('button').forEach(node => { node.disabled = false; });
+      }
+    }
+    loadReview();
     copyResult.addEventListener('click', () => {
       copyCurrentTable().catch(error => {
         status.textContent = `复制失败：${error}`;
