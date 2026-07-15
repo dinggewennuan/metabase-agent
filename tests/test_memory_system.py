@@ -587,3 +587,37 @@ def test_pgvector_ensure_schema_keeps_matching_table() -> None:
     index.ensure_schema()
 
     assert not any(sql.startswith("DROP TABLE") for sql in executed)
+
+
+def test_llm_extractor_parses_object_wrapper_from_json_mode(monkeypatch) -> None:
+    from metabase_agent.memory import extractor
+
+    # json_object mode forces an object wrapper, not a bare array.
+    llm_output = '{"memories": [{"memory_type": "semantic", "key": "note.fs_results", "content": "fs_results 是 faceswap 记录结果表。", "confidence": 0.9}]}'
+    monkeypatch.setattr(extractor, "complete", lambda *args, **kwargs: llm_output)
+
+    candidates = extractor.extract_candidates_with_llm("q", "a", None, Settings(OPENAI_API_KEY="k"))
+
+    assert len(candidates) == 1
+    assert candidates[0].key == "note.fs_results"
+
+
+def test_llm_extractor_parses_unknown_object_wrapper_key(monkeypatch) -> None:
+    from metabase_agent.memory import extractor
+
+    # Model wraps under an unexpected key — the first list value is still found.
+    llm_output = '{"extracted": [{"memory_type": "semantic", "content": "默认库是 BigQuery-GA。", "confidence": 0.8}]}'
+    monkeypatch.setattr(extractor, "complete", lambda *args, **kwargs: llm_output)
+
+    candidates = extractor.extract_candidates_with_llm("q", "a", None, Settings(OPENAI_API_KEY="k"))
+
+    assert len(candidates) == 1
+    assert candidates[0].content == "默认库是 BigQuery-GA。"
+
+
+def test_llm_extractor_empty_object_yields_no_candidates(monkeypatch) -> None:
+    from metabase_agent.memory import extractor
+
+    monkeypatch.setattr(extractor, "complete", lambda *args, **kwargs: '{"memories": []}')
+
+    assert extractor.extract_candidates_with_llm("q", "a", None, Settings(OPENAI_API_KEY="k")) == []
