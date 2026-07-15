@@ -132,11 +132,17 @@ def iter_tool_loop(
                 # Multi-step analyses legitimately need several SQL statements,
                 # each with its own approval. Say so explicitly — otherwise the
                 # repeated review prompt reads like a broken loop.
-                approval_answer = (
+                prompt_line = (
                     "上一条已授权的 SQL 已执行完成。为了继续分析，需要再执行一条**新的** SQL——请 review 后授权执行，或拒绝。"
                     if approved_sql is not None
                     else "请先 review 这条 SQL，确认后授权执行，或拒绝本次执行。"
                 )
+                database_name = str(call.arguments.get("database_name") or "")
+                database_line = f"\n目标数据库：`{database_name}`" if database_name else ""
+                # The SQL must be IN the message: the reviewer can't approve
+                # what they can't see (query_result.sql alone only shows up in
+                # the raw JSON panel).
+                approval_answer = f"{prompt_line}{database_line}\n\n```sql\n{sql}\n```"
                 yield "outcome", LoopOutcome(
                     status="requires_approval",
                     answer=approval_answer,

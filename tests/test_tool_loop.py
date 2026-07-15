@@ -628,3 +628,19 @@ def test_resumed_loop_labels_followup_sql_as_new(monkeypatch) -> None:
     assert outcome.pending_sql == "SELECT 2 AS next_step"
     assert "已执行完成" in outcome.answer
     assert "新的" in outcome.answer
+
+
+def test_approval_prompt_embeds_the_sql_to_review() -> None:
+    transport = _ScriptedTransport(
+        [
+            [ToolCall(id="c1", name="run_sql", arguments={"sql": "SELECT count(*) FROM t", "database_name": "BigQuery-GA"})],
+        ]
+    )
+
+    outcome = run_tool_loop("查一下", [], transport, _tools())
+
+    # The reviewer can't approve what they can't see.
+    assert outcome.status == "requires_approval"
+    assert "```sql" in outcome.answer
+    assert "SELECT count(*) FROM t" in outcome.answer
+    assert "BigQuery-GA" in outcome.answer
