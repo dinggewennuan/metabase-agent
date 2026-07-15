@@ -50,6 +50,18 @@
     .bubble-content.collapsible { position: relative; }
     .bubble-content.collapsed { max-height: 120px; overflow: hidden; }
     .bubble-content.collapsed::after { content: ''; position: absolute; left: 16px; right: 16px; bottom: 14px; height: 54px; background: linear-gradient(rgba(255,255,255,0), rgba(255,255,255,.92)); pointer-events: none; border-radius: 0 0 18px 18px; }
+    .bubble-content .md-line { min-height: 0; }
+    .bubble-content .md-gap { height: .55em; }
+    .md-table-wrap { overflow-x: auto; margin: 8px 0; }
+    .md-table { border-collapse: collapse; font-size: 13px; white-space: nowrap; }
+    .md-table th, .md-table td { border: 1px solid var(--line); padding: 5px 10px; text-align: left; }
+    .md-table th { background: rgba(0,0,0,.05); font-weight: 800; }
+    .md-table tbody tr:nth-child(even) td { background: rgba(0,0,0,.022); }
+    .md-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .md-code { background: #24272d; color: #ece9e2; padding: 10px 12px; border-radius: 10px; overflow-x: auto; font-size: 12.5px; margin: 8px 0; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .md-inline-code { background: rgba(0,0,0,.07); border-radius: 5px; padding: 1px 5px; font-size: .92em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .md-list { margin: 4px 0 4px 20px; padding: 0; }
+    .md-list li { margin: 2px 0; }
     .approval-actions { display: flex; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
     .approval-actions button { border-radius: 12px; padding: 8px 11px; font-size: 12px; }
     .approval-actions .reject { border: 1px solid var(--line); background: rgba(255,255,255,.72); color: var(--ink); }
@@ -205,6 +217,143 @@
     }
     sessionInput.value = localStorage.getItem(storageKey) || makeSessionId();
     localStorage.setItem(storageKey, sessionInput.value);
+    // Safe lightweight markdown rendering for agent bubbles: everything is
+    // built with createElement/textContent (never innerHTML on model output),
+    // so LLM answers can carry tables/code without opening an XSS surface.
+    function appendInline(el, text) {
+      const pattern = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+      let last = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        if (match.index > last) {
+          el.appendChild(document.createTextNode(text.slice(last, match.index)));
+        }
+        const token = match[0];
+        if (token.startsWith('`')) {
+          const code = document.createElement('code');
+          code.className = 'md-inline-code';
+          code.textContent = token.slice(1, -1);
+          el.appendChild(code);
+        } else {
+          const strong = document.createElement('strong');
+          strong.textContent = token.slice(2, -2);
+          el.appendChild(strong);
+        }
+        last = match.index + token.length;
+      }
+      if (last < text.length) {
+        el.appendChild(document.createTextNode(text.slice(last)));
+      }
+    }
+    function splitTableRow(line) {
+      return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim());
+    }
+    function renderMarkdownInto(container, rawText) {
+      container.textContent = '';
+      container.dataset.raw = rawText || '';
+      const lines = String(rawText || '').split('\n');
+      let index = 0;
+      let list = null;
+      while (index < lines.length) {
+        const line = lines[index];
+        if (/^\s*```/.test(line)) {
+          list = null;
+          const codeLines = [];
+          index += 1;
+          while (index < lines.length && !/^\s*```/.test(lines[index])) {
+            codeLines.push(lines[index]);
+            index += 1;
+          }
+          index += 1;
+          const pre = document.createElement('pre');
+          pre.className = 'md-code';
+          const code = document.createElement('code');
+          code.textContent = codeLines.join('\n');
+          pre.appendChild(code);
+          container.appendChild(pre);
+          continue;
+        }
+        if (/^\s*\|/.test(line) && index + 1 < lines.length && /^\s*\|?[\s:\-|]+\|?\s*$/.test(lines[index + 1]) && lines[index + 1].includes('-')) {
+          list = null;
+          const headers = splitTableRow(line);
+          index += 2;
+          const rows = [];
+          while (index < lines.length && /^\s*\|/.test(lines[index])) {
+            rows.push(splitTableRow(lines[index]));
+            index += 1;
+          }
+          const wrap = document.createElement('div');
+          wrap.className = 'md-table-wrap';
+          const table = document.createElement('table');
+          table.className = 'md-table';
+          const thead = document.createElement('thead');
+          const headRow = document.createElement('tr');
+          headers.forEach(cell => {
+            const th = document.createElement('th');
+            appendInline(th, cell);
+            headRow.appendChild(th);
+          });
+          thead.appendChild(headRow);
+          const tbody = document.createElement('tbody');
+          rows.forEach(cells => {
+            const tr = document.createElement('tr');
+            cells.forEach(cell => {
+              const td = document.createElement('td');
+              if (/^[-+]?[\d,.]+\s*%?$/.test(cell)) {
+                td.classList.add('num');
+              }
+              appendInline(td, cell);
+              tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+          });
+          table.append(thead, tbody);
+          wrap.appendChild(table);
+          container.appendChild(wrap);
+          continue;
+        }
+        const listMatch = line.match(/^\s*[-*]\s+(.*)$/);
+        if (listMatch) {
+          if (!list) {
+            list = document.createElement('ul');
+            list.className = 'md-list';
+            container.appendChild(list);
+          }
+          const item = document.createElement('li');
+          appendInline(item, listMatch[1]);
+          list.appendChild(item);
+          index += 1;
+          continue;
+        }
+        list = null;
+        if (!line.trim()) {
+          const gap = document.createElement('div');
+          gap.className = 'md-gap';
+          container.appendChild(gap);
+          index += 1;
+          continue;
+        }
+        const heading = line.match(/^\s*#{1,4}\s+(.*)$/);
+        const paragraph = document.createElement('div');
+        paragraph.className = 'md-line';
+        if (heading) {
+          paragraph.style.fontWeight = '800';
+          appendInline(paragraph, heading[1]);
+        } else {
+          appendInline(paragraph, line);
+        }
+        container.appendChild(paragraph);
+        index += 1;
+      }
+    }
+    function setBubbleText(content, role, text) {
+      if (role === 'agent') {
+        renderMarkdownInto(content, text);
+      } else {
+        content.textContent = text;
+        content.dataset.raw = text || '';
+      }
+    }
     function addBubble(role, text) {
       const turn = document.createElement('div');
       turn.className = `turn ${role}`;
@@ -228,7 +377,7 @@
       toggle.textContent = '折叠';
       const content = document.createElement('div');
       content.className = 'bubble-content';
-      content.textContent = text;
+      setBubbleText(content, role, text);
       copy.addEventListener('click', () => copyBubbleText(content, copy));
       toggle.addEventListener('click', () => toggleBubbleCollapse(content, toggle));
       const actions = document.createElement('div');
@@ -262,7 +411,9 @@
       area.remove();
     }
     async function copyBubbleText(content, button) {
-      await copyText(content.textContent || '');
+      // Copy the ORIGINAL markdown, not the rendered DOM text (tables would
+      // otherwise lose their structure when pasted).
+      await copyText(content.dataset.raw || content.textContent || '');
       const original = button.textContent;
       button.textContent = 'Copied';
       status.textContent = '对话内容已复制';
@@ -425,7 +576,7 @@
       queryPlan.textContent = JSON.stringify(data.query_plan, null, 2);
       program.textContent = JSON.stringify(data.program, null, 2);
       if (turn) {
-        bubbleContent(turn).textContent = data.answer || '';
+        setBubbleText(bubbleContent(turn), 'agent', data.answer || '');
         attachApprovalActions(turn, data.query_result);
         updateBubbleCollapse(turn);
       } else {
