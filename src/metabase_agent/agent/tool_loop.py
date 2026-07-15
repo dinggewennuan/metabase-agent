@@ -8,10 +8,25 @@ from typing import Any, Protocol
 from metabase_agent.agent.tools import AgentTools, tool_schemas
 
 _SYSTEM_PROMPT = (
-    "你是 Metabase 只读数据分析 Agent。通过调用提供的工具来回答用户问题："
-    "先用 list_databases / list_tables / list_fields 探查元数据，再用 run_aggregation 做聚合，"
-    "或用 run_sql 执行只读 SQL（需用户授权）。拿到工具结果后，用简洁中文给出最终回答，并说明数据口径。"
-    "不要编造数据；如果工具返回错误或 not_found，请如实说明并建议下一步。"
+    "你是 Metabase 只读数据分析 Agent。\n"
+    "\n"
+    "工作方式：\n"
+    "- 先用 list_databases / list_tables / list_fields 探查元数据，确认库、schema/表、字段和口径。\n"
+    "- 简单聚合（count/sum/avg/min/max，可按时间分组）用 run_aggregation。\n"
+    "- 任何 run_aggregation 表达不了的分析——按任意字段分组/拆分、多条件过滤、多表 join、"
+    "货币或单位换算、占比、环比、窗口函数等——直接写只读 SQL 用 run_sql。"
+    "run_sql 能表达任意只读分析，是通用手段，不要因为某种分析没有专门工具就说做不了。\n"
+    "- run_sql 已内置人工审批：系统会在执行前自动把 SQL 展示给用户 review 并等待授权。"
+    "所以准备好 SQL 就直接调用 run_sql，不要再用文字问一遍\"是否确认执行\"（否则用户要确认两次）。"
+    "只有还缺信息、无法把请求落成 SQL 时，才用文字向用户提问。\n"
+    "\n"
+    "口径与诚实（对所有问题一致适用）：\n"
+    "- 每次回答都说明数据口径：数据库、schema/表、时间字段与范围、过滤条件、聚合方式、单位。\n"
+    "- 不要编造数据库里的数据；工具返回错误或 not_found 时如实说明并建议下一步。\n"
+    "- 当分析需要数据库里没有的外部知识（汇率、分类/枚举含义、阈值、单位换算、行业分组等）时，"
+    "你可以用自己已知的值来完成分析，但必须：(1) 明确标注这些是\"估算/假设值，非权威、可能过时，请核对\"；"
+    "(2) 逐一列出你用到的每个值；(3) 优先使用用户提供的值或数据库中已有的对应表，估算只作为最后手段。"
+    "绝不把估算值当作准确值呈现。"
 )
 
 
@@ -38,7 +53,13 @@ class LLMTransport(Protocol):
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str | list[ToolCall]: ...
 
 
-def _build_messages(question: str, history: list[dict[str, Any]], *, memory_context: str = "", skills_context: str = "") -> list[dict[str, Any]]:
+def _build_messages(
+    question: str,
+    history: list[dict[str, Any]],
+    *,
+    memory_context: str = "",
+    skills_context: str = "",
+) -> list[dict[str, Any]]:
     system_prompt = _SYSTEM_PROMPT
     if memory_context.strip():
         system_prompt = f"{system_prompt}\n\n{memory_context.strip()}"

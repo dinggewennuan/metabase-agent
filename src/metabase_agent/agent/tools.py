@@ -93,7 +93,7 @@ def tool_schemas() -> list[dict[str, Any]]:
         },
         {
             "name": "run_sql",
-            "description": "执行一条只读 SELECT/WITH SQL。执行前需要用户授权。",
+            "description": "执行一条只读 SELECT/WITH SQL。系统会在执行前自动展示 SQL 给用户 review 并等待授权，你无需在文字里再问一次确认，准备好就直接调用。",
             "parameters": {
                 "type": "object",
                 "properties": {

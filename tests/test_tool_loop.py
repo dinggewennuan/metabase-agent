@@ -666,3 +666,30 @@ def test_approval_prompt_embeds_the_sql_to_review() -> None:
     assert "```sql" in outcome.answer
     assert "SELECT count(*) FROM t" in outcome.answer
     assert "BigQuery-GA" in outcome.answer
+
+
+def test_system_prompt_tells_model_not_to_double_confirm_sql() -> None:
+    transport = _ScriptedTransport(["完成。"])
+
+    run_tool_loop("查一下", [], transport, _tools())
+
+    system_prompt = transport.calls[0]["messages"][0]["content"]
+    # The model must know run_sql already gates on approval, so it doesn't add
+    # its own redundant "请回复确认执行" text step (double confirmation).
+    assert "内置" in system_prompt and "审批" in system_prompt
+    assert "确认两次" in system_prompt
+
+
+def test_system_prompt_has_general_policies_not_per_feature_hacks() -> None:
+    transport = _ScriptedTransport(["完成。"])
+
+    run_tool_loop("查一下", [], transport, _tools())
+
+    system_prompt = transport.calls[0]["messages"][0]["content"]
+    # run_sql is presented as the universal analytical path (no per-analysis features).
+    assert "run_sql" in system_prompt and "通用" in system_prompt
+    # ONE general external-knowledge policy covers FX and any similar case:
+    # use estimates only with mandatory disclosure, prefer DB/user values.
+    assert "外部知识" in system_prompt
+    assert "估算" in system_prompt and "请核对" in system_prompt
+    assert "汇率" in system_prompt  # named only as an example of the general rule
