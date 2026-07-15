@@ -66,6 +66,10 @@ def _parse_candidates(content: str | None) -> list[CandidateMemory]:
         candidate = _validate_candidate(item)
         if candidate is not None:
             candidates.append(candidate)
+    # Make "extractor produced nothing" observable: without this line, a model
+    # that returned candidates all failing the gate is indistinguishable from
+    # one that returned an empty list.
+    _LOGGER.info("memory.extractor: LLM proposed %s item(s), %s passed validation", len(items), len(candidates))
     return candidates
 
 

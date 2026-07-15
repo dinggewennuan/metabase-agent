@@ -129,6 +129,9 @@ class MemoryManager:
 
     def _llm_candidates(self, *, question: str, answer: str, query_plan: dict[str, Any] | None) -> list[CandidateMemory]:
         if self.llm_extractor is None:
+            # Distinguishes "extractor disabled/not wired" from "ran but empty"
+            # when diagnosing why nothing was extracted.
+            _LOGGER.debug("memory.llm_extractor is not configured; using rule-based candidates only")
             return []
         try:
             return self.llm_extractor(question, answer, query_plan)

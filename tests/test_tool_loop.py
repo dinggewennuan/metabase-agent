@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+import pytest
 
 from metabase_agent.agent.tool_loop import ToolCall, run_tool_loop
 from metabase_agent.agent.tools import AgentTools, tool_schemas
@@ -579,9 +580,10 @@ def test_chat_httpx_transport_retries_without_reasoning_effort(monkeypatch) -> N
     assert "reasoning_effort" not in attempts[1]
 
 
-def test_chat_httpx_retries_once_on_transport_error(monkeypatch) -> None:
+def test_chat_httpx_retries_on_transport_error(monkeypatch) -> None:
     from metabase_agent.semantics import llm_client
 
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
     attempts: list[int] = []
 
     class _Resp:
@@ -593,9 +595,9 @@ def test_chat_httpx_retries_once_on_transport_error(monkeypatch) -> None:
 
     def _fake_post(url: str, **kwargs: Any) -> _Resp:
         attempts.append(1)
-        if len(attempts) == 1:
-            # Gateway/proxy dropped the kept-alive connection without responding.
-            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        # Two consecutive TLS handshakes die (SSL UNEXPECTED_EOF) before success.
+        if len(attempts) <= 2:
+            raise httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
         return _Resp()
 
     monkeypatch.setattr(llm_client.httpx, "post", _fake_post)
@@ -604,7 +606,27 @@ def test_chat_httpx_retries_once_on_transport_error(monkeypatch) -> None:
     text = llm_client.complete("system", "user", settings)
 
     assert text == "ok"
-    assert len(attempts) == 2
+    assert len(attempts) == 3
+
+
+def test_chat_httpx_gives_up_after_max_transport_retries(monkeypatch) -> None:
+    from metabase_agent.semantics import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    attempts: list[int] = []
+
+    def _fake_post(url: str, **kwargs: Any):
+        attempts.append(1)
+        raise httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+
+    monkeypatch.setattr(llm_client.httpx, "post", _fake_post)
+    settings = Settings(OPENAI_API_KEY="k", OPENAI_WIRE_API="chat_completions_httpx")
+
+    with pytest.raises(httpx.TransportError):
+        llm_client.complete("system", "user", settings)
+
+    # Initial attempt + the configured backoff retries.
+    assert len(attempts) == len(llm_client._TRANSPORT_RETRY_BACKOFF) + 1
 
 
 def test_resumed_loop_labels_followup_sql_as_new(monkeypatch) -> None:

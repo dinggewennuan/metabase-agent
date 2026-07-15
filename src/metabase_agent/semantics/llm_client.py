@@ -13,6 +13,8 @@ production reject SDK-shaped requests. Do not "simplify" them back to the SDK.
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
@@ -24,7 +26,14 @@ from metabase_agent.config.settings import Settings
 if TYPE_CHECKING:
     from metabase_agent.agent.tool_loop import ToolCall
 
+_LOGGER = logging.getLogger("metabase_agent")
+
 ReasoningEffort = Literal["high", "xhigh"]
+
+# Transport-level flakiness (proxy drops the TLS handshake / connection with
+# "UNEXPECTED_EOF" or "Server disconnected") is intermittent on the akool
+# gateway, so a few spaced retries recover most turns that would otherwise die.
+_TRANSPORT_RETRY_BACKOFF = (0.4, 1.0, 2.0)
 
 
 def reasoning_effort(model: str) -> ReasoningEffort:
@@ -96,17 +105,28 @@ def _post_chat_completions(settings: Settings, body: dict[str, Any]) -> dict[str
     # (x-stainless-*) for a gateway WAF to block.
     url = f"{settings.openai_base_url.rstrip('/')}/chat/completions"
     headers = _llm_headers(settings)
-    try:
-        response = httpx.post(url, headers=headers, json=body, timeout=settings.openai_timeout)
-    except httpx.TransportError:
-        # Gateways/proxies occasionally drop a kept-alive connection without a
-        # response ("Server disconnected"). Nothing was received, so one
-        # immediate retry on a fresh connection is safe — without it a whole
-        # multi-tool turn (including an already-executed approved SQL) is lost.
-        response = httpx.post(url, headers=headers, json=body, timeout=settings.openai_timeout)
+    response = _post_with_transport_retry(url, headers, body, settings.openai_timeout)
     response.raise_for_status()
     payload = response.json()
     return payload if isinstance(payload, dict) else {}
+
+
+def _post_with_transport_retry(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float) -> httpx.Response:
+    """POST with retries on TransportError only.
+
+    A TransportError means no response was received (TLS handshake / connection
+    dropped), so retrying is safe — no risk of duplicating a side effect. HTTP
+    status errors are NOT retried here (handled by the 4xx-fallback caller).
+    """
+    for attempt, backoff in enumerate((*_TRANSPORT_RETRY_BACKOFF, None)):
+        try:
+            return httpx.post(url, headers=headers, json=body, timeout=timeout)
+        except httpx.TransportError as exc:
+            if backoff is None:
+                raise
+            _LOGGER.warning("llm transport error (attempt %s), retrying in %ss: %s", attempt + 1, backoff, exc)
+            time.sleep(backoff)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 # Body keys beyond the bare {model, messages, tools} minimum. Some gateways
